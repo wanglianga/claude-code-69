@@ -43,6 +43,8 @@ CREATE TABLE IF NOT EXISTS renovation_orders (
     opening_allowed       BOOLEAN NOT NULL DEFAULT FALSE,
     fire_permit_passed    BOOLEAN NOT NULL DEFAULT FALSE,  -- 开业前消防许可（强电/排烟/喷淋等关键项全过）
     total_penalty         NUMERIC(12,2) NOT NULL DEFAULT 0,
+    night_work_blocked    BOOLEAN NOT NULL DEFAULT FALSE,   -- 动火复核/异常联动：当晚施工许可是否被暂停
+    night_block_reason    VARCHAR(256) NOT NULL DEFAULT '',
     created_at            TIMESTAMP NOT NULL DEFAULT now(),
     updated_at            TIMESTAMP NOT NULL DEFAULT now()
 );
@@ -94,12 +96,35 @@ CREATE TABLE IF NOT EXISTS special_work_permits (
     reason         VARCHAR(256) NOT NULL,
     planned_start  TIMESTAMP NOT NULL,
     planned_end    TIMESTAMP NOT NULL,
-    status         VARCHAR(16) NOT NULL DEFAULT 'APPLIED',  -- APPLIED/APPROVED/REJECTED/IN_PROGRESS/FINISHED
+    status         VARCHAR(16) NOT NULL DEFAULT 'APPLIED',  -- APPLIED/APPROVED/REJECTED/IN_PROGRESS/FINISHED/PAUSED/CANCELLED
     fire_watcher   VARCHAR(64),
     extinguisher_count INT NOT NULL DEFAULT 0,
     approver_id    BIGINT REFERENCES users(id),
     created_at     TIMESTAMP NOT NULL DEFAULT now(),
-    decided_at     TIMESTAMP
+    decided_at     TIMESTAMP,
+    -- 动火/切割现场（安保）复核
+    site_review_status   VARCHAR(12) NOT NULL DEFAULT 'NONE', -- NONE/PASSED/FAILED
+    site_review_round    INT NOT NULL DEFAULT 0,             -- 暂停后恢复必须 +1 重新复核，不能沿用原审批
+    site_reviewer_id     BIGINT REFERENCES users(id),
+    site_reviewed_at     TIMESTAMP,
+    paused_reason        VARCHAR(48)                          -- SMOKE_ALARM/WATCHER_LEAVE/SITE_CHECK_FAILED
+);
+
+-- 动火现场复核与作业过程记录：复核项、开始、结束、异常暂停、恢复复核全部回写装修单
+CREATE TABLE IF NOT EXISTS permit_site_logs (
+    id               BIGSERIAL PRIMARY KEY,
+    permit_id        BIGINT NOT NULL REFERENCES special_work_permits(id),
+    order_id         BIGINT NOT NULL REFERENCES renovation_orders(id),
+    review_round     INT NOT NULL DEFAULT 0,
+    action           VARCHAR(24) NOT NULL,  -- SITE_CHECK_PASS/SITE_CHECK_FAIL/START/FINISH/ABNORMAL_PAUSE/RESUME_RECHECK_PASS/CANCEL
+    permit_present   BOOLEAN NOT NULL DEFAULT FALSE,  -- 动火证在场
+    extinguisher_ok  BOOLEAN NOT NULL DEFAULT FALSE,  -- 灭火器就位
+    watcher_present  BOOLEAN NOT NULL DEFAULT FALSE,  -- 监护人在岗
+    smoke_protected  BOOLEAN NOT NULL DEFAULT FALSE,  -- 烟感保护到位
+    hours_ok         BOOLEAN NOT NULL DEFAULT FALSE,  -- 作业时段避开商场营业时段（服务端判定）
+    detail           VARCHAR(512) NOT NULL DEFAULT '',
+    recorded_by      BIGINT REFERENCES users(id),
+    created_at       TIMESTAMP NOT NULL DEFAULT now()
 );
 
 -- 施工过程事件：超时/噪声/堆占通道/烟感遮挡/喷淋改动/顾客投诉/临时改图
@@ -177,3 +202,13 @@ CREATE INDEX IF NOT EXISTS idx_incidents_order ON incidents(order_id);
 CREATE INDEX IF NOT EXISTS idx_items_order   ON acceptance_check_items(order_id);
 CREATE INDEX IF NOT EXISTS idx_rect_order    ON rectifications(order_id);
 CREATE INDEX IF NOT EXISTS idx_events_order  ON order_events(order_id);
+CREATE INDEX IF NOT EXISTS idx_permit_logs   ON permit_site_logs(permit_id);
+
+-- 兼容已存在的旧库：幂等补齐动火现场复核字段
+ALTER TABLE renovation_orders ADD COLUMN IF NOT EXISTS night_work_blocked BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE renovation_orders ADD COLUMN IF NOT EXISTS night_block_reason VARCHAR(256) NOT NULL DEFAULT '';
+ALTER TABLE special_work_permits ADD COLUMN IF NOT EXISTS site_review_status VARCHAR(12) NOT NULL DEFAULT 'NONE';
+ALTER TABLE special_work_permits ADD COLUMN IF NOT EXISTS site_review_round INT NOT NULL DEFAULT 0;
+ALTER TABLE special_work_permits ADD COLUMN IF NOT EXISTS site_reviewer_id BIGINT REFERENCES users(id);
+ALTER TABLE special_work_permits ADD COLUMN IF NOT EXISTS site_reviewed_at TIMESTAMP;
+ALTER TABLE special_work_permits ADD COLUMN IF NOT EXISTS paused_reason VARCHAR(48);

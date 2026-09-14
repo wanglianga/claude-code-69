@@ -21,6 +21,7 @@ skills/
 **/skill/
 **/skills/
 .claude/
+.playwright-cli/
 CLAUDE.md
 *_traces/
 traces/

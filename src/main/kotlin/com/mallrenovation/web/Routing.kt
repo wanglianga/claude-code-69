@@ -120,6 +120,14 @@ fun Application.configureRouting() {
             post("/api/permits/{id}/finish") {
                 call.respond(Service.permitLifecycle(call.parameters["id"]!!.toLong(), true, me))
             }
+            // 动火/切割：安保现场复核五项条件
+            post("/api/permits/{id}/site-review") {
+                call.respond(Service.siteReviewPermit(call.parameters["id"]!!.toLong(), call.receive(), me))
+            }
+            // 动火期间烟感异常/监护人离岗 → 自动暂停
+            post("/api/permits/{id}/abnormal") {
+                call.respond(Service.reportPermitAbnormal(call.parameters["id"]!!.toLong(), call.receive(), me))
+            }
 
             // 施工过程事件与多方处置
             post("/api/orders/{id}/incidents") {

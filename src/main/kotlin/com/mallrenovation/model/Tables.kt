@@ -46,6 +46,8 @@ object RenovationOrders : Table("renovation_orders") {
     val openingAllowed = bool("opening_allowed").default(false)
     val firePermitPassed = bool("fire_permit_passed").default(false)
     val totalPenalty = decimal("total_penalty", 12, 2).default(0.toBigDecimal())
+    val nightWorkBlocked = bool("night_work_blocked").default(false)
+    val nightBlockReason = varchar("night_block_reason", 256).default("")
     val createdAt = timestamp("created_at")
     val updatedAt = timestamp("updated_at")
     override val primaryKey = PrimaryKey(id)
@@ -105,6 +107,28 @@ object SpecialWorkPermits : Table("special_work_permits") {
     val approverId = long("approver_id").nullable()
     val createdAt = timestamp("created_at")
     val decidedAt = timestamp("decided_at").nullable()
+    val siteReviewStatus = varchar("site_review_status", 12).default("NONE")
+    val siteReviewRound = integer("site_review_round").default(0)
+    val siteReviewerId = long("site_reviewer_id").nullable()
+    val siteReviewedAt = timestamp("site_reviewed_at").nullable()
+    val pausedReason = varchar("paused_reason", 48).nullable()
+    override val primaryKey = PrimaryKey(id)
+}
+
+object PermitSiteLogs : Table("permit_site_logs") {
+    val id = long("id").autoIncrement()
+    val permitId = long("permit_id")
+    val orderId = long("order_id")
+    val reviewRound = integer("review_round")
+    val action = varchar("action", 24)
+    val permitPresent = bool("permit_present").default(false)
+    val extinguisherOk = bool("extinguisher_ok").default(false)
+    val watcherPresent = bool("watcher_present").default(false)
+    val smokeProtected = bool("smoke_protected").default(false)
+    val hoursOk = bool("hours_ok").default(false)
+    val detail = varchar("detail", 512).default("")
+    val recordedBy = long("recorded_by").nullable()
+    val createdAt = timestamp("created_at")
     override val primaryKey = PrimaryKey(id)
 }
 

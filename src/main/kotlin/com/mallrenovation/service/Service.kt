@@ -211,6 +211,8 @@ object Service {
             fireReinspectionPassed = o[RenovationOrders.fireReinspectionPassed],
             firePermitPassed = o[RenovationOrders.firePermitPassed],
             openingAllowed = o[RenovationOrders.openingAllowed],
+            nightWorkBlocked = o[RenovationOrders.nightWorkBlocked],
+            nightBlockReason = o[RenovationOrders.nightBlockReason],
             createdAt = o[RenovationOrders.createdAt].toString()
         )
     }
@@ -235,11 +237,24 @@ object Service {
                 it[MaterialItems.declaredFlameRetardant], it[MaterialItems.flameRetardantVerified],
                 it[MaterialItems.entryStatus], it[MaterialItems.gateRemark])
         }
-        val permits = SpecialWorkPermits.select { SpecialWorkPermits.orderId eq id }.orderBy(SpecialWorkPermits.id).map {
-            PermitView(it[SpecialWorkPermits.id], it[SpecialWorkPermits.workType], it[SpecialWorkPermits.reason],
-                it[SpecialWorkPermits.plannedStart].toString(), it[SpecialWorkPermits.plannedEnd].toString(),
-                it[SpecialWorkPermits.status], it[SpecialWorkPermits.fireWatcher], it[SpecialWorkPermits.extinguisherCount],
-                userName(it[SpecialWorkPermits.approverId]), it[SpecialWorkPermits.decidedAt]?.toString())
+        val permits = SpecialWorkPermits.select { SpecialWorkPermits.orderId eq id }.orderBy(SpecialWorkPermits.id).map { p ->
+            val logs = PermitSiteLogs.select { PermitSiteLogs.permitId eq p[SpecialWorkPermits.id] }
+                .orderBy(PermitSiteLogs.id).map { l ->
+                    SiteLogView(l[PermitSiteLogs.id], l[PermitSiteLogs.reviewRound], l[PermitSiteLogs.action],
+                        l[PermitSiteLogs.permitPresent], l[PermitSiteLogs.extinguisherOk],
+                        l[PermitSiteLogs.watcherPresent], l[PermitSiteLogs.smokeProtected], l[PermitSiteLogs.hoursOk],
+                        l[PermitSiteLogs.detail], userName(l[PermitSiteLogs.recordedBy]), l[PermitSiteLogs.createdAt].toString())
+                }
+            PermitView(p[SpecialWorkPermits.id], p[SpecialWorkPermits.workType], p[SpecialWorkPermits.reason],
+                p[SpecialWorkPermits.plannedStart].toString(), p[SpecialWorkPermits.plannedEnd].toString(),
+                p[SpecialWorkPermits.status], p[SpecialWorkPermits.fireWatcher], p[SpecialWorkPermits.extinguisherCount],
+                userName(p[SpecialWorkPermits.approverId]), p[SpecialWorkPermits.decidedAt]?.toString(),
+                siteReviewStatus = p[SpecialWorkPermits.siteReviewStatus],
+                siteReviewRound = p[SpecialWorkPermits.siteReviewRound],
+                siteReviewer = userName(p[SpecialWorkPermits.siteReviewerId]),
+                siteReviewedAt = p[SpecialWorkPermits.siteReviewedAt]?.toString(),
+                pausedReason = p[SpecialWorkPermits.pausedReason],
+                siteLogs = logs)
         }
         val incidents = Incidents.select { Incidents.orderId eq id }.orderBy(Incidents.id).map {
             val parties = RuleEngine.incidentParties[it[Incidents.type]] ?: emptyList()
@@ -376,6 +391,8 @@ object Service {
         val o = orderRow(orderId)
         if (o[RenovationOrders.status] != "UNDER_CONSTRUCTION")
             throw ApiException(409, "装修单未在施工状态，施工证未生效，禁止进场")
+        if (o[RenovationOrders.nightWorkBlocked])
+            throw ApiException(409, "当晚施工许可已暂停（${o[RenovationOrders.nightBlockReason]}），动火重新复核合格前禁止人员进场")
         val ready = w[Workers.idCardOk] && w[Workers.badgeOk] && w[Workers.insuranceOk] && w[Workers.toolsOk] && w[Workers.materialsOk]
         if (!ready) throw ApiException(409, "身份证/工牌/保险/工具/材料五项核验未全部通过，禁止进场")
         if (w[Workers.admitted]) throw ApiException(409, "该人员已进场")
@@ -456,22 +473,226 @@ object Service {
         MessageResp(if (approved) "作业票已批准" else "作业票已驳回")
     }
 
+    // ---------- 动火现场复核 ----------
+    private val hotWorkTypes = listOf("HOT_WORK", "CUTTING")
+
+    private fun siteLog(
+        permitId: Long, orderId: Long, round: Int, action: String,
+        permitPresent: Boolean, extinguisherOk: Boolean, watcherPresent: Boolean,
+        smokeProtected: Boolean, hoursOk: Boolean, detail: String, userId: Long?
+    ) {
+        PermitSiteLogs.insert {
+            it[PermitSiteLogs.permitId] = permitId
+            it[PermitSiteLogs.orderId] = orderId
+            it[PermitSiteLogs.reviewRound] = round
+            it[PermitSiteLogs.action] = action
+            it[PermitSiteLogs.permitPresent] = permitPresent
+            it[PermitSiteLogs.extinguisherOk] = extinguisherOk
+            it[PermitSiteLogs.watcherPresent] = watcherPresent
+            it[PermitSiteLogs.smokeProtected] = smokeProtected
+            it[PermitSiteLogs.hoursOk] = hoursOk
+            it[PermitSiteLogs.detail] = detail
+            it[PermitSiteLogs.recordedBy] = userId
+            it[PermitSiteLogs.createdAt] = Instant.now()
+        }
+    }
+
+    /** 计划作业窗口是否避开商场营业时段（按铺位营业起止小时逐日判定） */
+    private fun windowOutsideOperatingHours(start: Instant, end: Instant, shop: ResultRow): Boolean {
+        val opStart = shop[Shops.operatingStart]
+        val opEnd = shop[Shops.operatingEnd]
+        var day = start.atZone(cnZone).toLocalDate()
+        val lastDay = end.atZone(cnZone).toLocalDate()
+        while (!day.isAfter(lastDay)) {
+            val op1 = day.atTime(opStart, 0).atZone(cnZone).toInstant()
+            val op2 = day.atTime(opEnd, 0).atZone(cnZone).toInstant()
+            if (start.isBefore(op2) && end.isAfter(op1)) return false
+            day = day.plusDays(1)
+        }
+        return true
+    }
+
+    private fun setNightBlock(orderId: Long, blocked: Boolean, reason: String) {
+        RenovationOrders.update({ RenovationOrders.id eq orderId }) {
+            it[nightWorkBlocked] = blocked
+            it[nightBlockReason] = reason
+        }
+    }
+
+    /** 安保现场复核动火/切割条件：动火证、灭火器、监护人、烟感保护、营业时段 */
+    fun siteReviewPermit(permitId: Long, req: SiteReviewReq, user: AppUser): MessageResp {
+        // 复核失败也必须把记录/夜间许可联动落库，因此事务先提交、再在事务外抛出 409
+        val outcome: Pair<Boolean, String> = transaction {
+            if (user.role !in listOf("SECURITY", "ADMIN")) throw ApiException(403, "动火现场复核由安保执行")
+            val p = SpecialWorkPermits.select { SpecialWorkPermits.id eq permitId }.firstOrNull()
+                ?: throw ApiException(404, "作业票不存在")
+            if (p[SpecialWorkPermits.workType] !in hotWorkTypes)
+                throw ApiException(409, "仅动火/切割作业需要现场复核")
+            if (p[SpecialWorkPermits.status] !in listOf("APPROVED", "PAUSED"))
+                throw ApiException(409, "仅已批准或已暂停的动火作业可进行现场复核（当前 ${p[SpecialWorkPermits.status]}）")
+            val orderId = p[SpecialWorkPermits.orderId]
+            val o = orderRow(orderId)
+            if (o[RenovationOrders.status] != "UNDER_CONSTRUCTION") throw ApiException(409, "装修单不在施工状态")
+
+            // 暂停后恢复：必须存在暂停之后的全新复核，不能沿用原审批
+            val resuming = p[SpecialWorkPermits.status] == "PAUSED"
+            if (resuming) {
+                val lastPause = PermitSiteLogs
+                    .select { (PermitSiteLogs.permitId eq permitId) and (PermitSiteLogs.action eq "ABNORMAL_PAUSE") }
+                    .maxByOrNull { it[PermitSiteLogs.id] }
+                if (lastPause != null) {
+                    val recheck = PermitSiteLogs.select {
+                        (PermitSiteLogs.permitId eq permitId) and
+                            (PermitSiteLogs.action eq "SITE_CHECK_PASS") and
+                            (PermitSiteLogs.id greater lastPause[PermitSiteLogs.id])
+                    }.count()
+                    if (recheck > 0L) throw ApiException(409, "已完成恢复复核，直接申请恢复作业即可")
+                }
+            }
+
+            val shop = shopRow(o[RenovationOrders.shopId])
+            val hoursOk = windowOutsideOperatingHours(p[SpecialWorkPermits.plannedStart], p[SpecialWorkPermits.plannedEnd], shop)
+            val round = p[SpecialWorkPermits.siteReviewRound] + 1
+            val failedItems = buildList {
+                if (!req.permitPresent) add("动火证不在场")
+                if (!req.extinguisherOk) add("灭火器未就位")
+                if (!req.watcherPresent) add("监护人（看火人）离岗")
+                if (!req.smokeProtected) add("烟感保护不到位")
+                if (!hoursOk) add("作业窗口处于商场营业时段")
+            }
+            val passed = failedItems.isEmpty()
+            val typeName = RuleEngine.permitNames[p[SpecialWorkPermits.workType]]
+
+            siteLog(
+                permitId, orderId, round, if (passed) "SITE_CHECK_PASS" else "SITE_CHECK_FAIL",
+                req.permitPresent, req.extinguisherOk, req.watcherPresent, req.smokeProtected, hoursOk,
+                (if (passed) "现场复核通过（第 $round 轮）" else "现场复核不合格：${failedItems.joinToString("、")}") +
+                    if (req.note.isNotBlank()) "；${req.note}" else "",
+                user.id
+            )
+
+            if (!passed) {
+                SpecialWorkPermits.update({ SpecialWorkPermits.id eq permitId }) {
+                    it[siteReviewStatus] = "FAILED"
+                    it[siteReviewRound] = round
+                    it[siteReviewerId] = user.id
+                    it[siteReviewedAt] = Instant.now()
+                }
+                val reason = "动火现场复核未通过（${failedItems.joinToString("、")}），暂停当晚施工许可"
+                setNightBlock(orderId, true, reason)
+                event(orderId, "HOTWORK_SITE_REVIEW_FAIL",
+                    "${typeName}票 #$permitId 第 $round 轮现场复核未通过：${failedItems.joinToString("、")}", user.id)
+                notify(orderId, listOf("MERCHANT", "SECURITY", "FIRE", "FLOOR_OPS"),
+                    "${typeName}现场复核未通过，已暂停当晚施工许可，整改后须重新复核")
+                false to "现场复核未通过：${failedItems.joinToString("、")}；当晚施工许可已暂停"
+            } else {
+                SpecialWorkPermits.update({ SpecialWorkPermits.id eq permitId }) {
+                    it[siteReviewStatus] = "PASSED"
+                    it[siteReviewRound] = round
+                    it[siteReviewerId] = user.id
+                    it[siteReviewedAt] = Instant.now()
+                    it[pausedReason] = null
+                }
+                event(orderId, "HOTWORK_SITE_REVIEW_PASS",
+                    "${typeName}票 #$permitId 第 $round 轮现场复核通过：动火证/灭火器/监护人/烟感保护齐备且避开营业时段", user.id)
+                if (o[RenovationOrders.nightWorkBlocked]) {
+                    setNightBlock(orderId, false, "")
+                    event(orderId, "NIGHT_WORK_RESTORED", "动火现场复核（第 $round 轮）通过，当晚施工许可恢复", user.id)
+                    notify(orderId, listOf("MERCHANT", "SECURITY"), "动火现场条件复核合格，当晚施工许可恢复")
+                }
+                true to (
+                    if (resuming) "恢复复核通过（第 $round 轮，重新复核而非沿用原审批），可恢复动火作业"
+                    else "现场复核通过（第 $round 轮），可开始动火作业"
+                )
+            }
+        }
+        if (!outcome.first) throw ApiException(409, outcome.second)
+        return MessageResp(outcome.second)
+    }
+
+    /** 动火期间异常（烟感异常/监护人离岗）：自动暂停并通知安保复核 */
+    fun reportPermitAbnormal(permitId: Long, req: AbnormalReq, user: AppUser): MessageResp = transaction {
+        if (user.role !in listOf("SECURITY", "FIRE", "PROPERTY", "ADMIN"))
+            throw ApiException(403, "仅安保/消防/物业可上报动火异常")
+        if (req.type !in listOf("SMOKE_ALARM", "WATCHER_LEAVE"))
+            throw ApiException(400, "异常类型必须为 SMOKE_ALARM（烟感异常）或 WATCHER_LEAVE（监护人离岗）")
+        val p = SpecialWorkPermits.select { SpecialWorkPermits.id eq permitId }.firstOrNull()
+            ?: throw ApiException(404, "作业票不存在")
+        if (p[SpecialWorkPermits.status] != "IN_PROGRESS")
+            throw ApiException(409, "仅进行中的动火作业可登记异常")
+        val orderId = p[SpecialWorkPermits.orderId]
+        val typeName = RuleEngine.permitNames[p[SpecialWorkPermits.workType]]
+        val reasonCn = if (req.type == "SMOKE_ALARM") "烟感异常报警" else "监护人（看火人）离岗"
+
+        SpecialWorkPermits.update({ SpecialWorkPermits.id eq permitId }) {
+            it[status] = "PAUSED"
+            it[pausedReason] = req.type
+            it[siteReviewStatus] = "NONE"
+        }
+        siteLog(permitId, orderId, p[SpecialWorkPermits.siteReviewRound], "ABNORMAL_PAUSE",
+            false, false, req.type != "WATCHER_LEAVE", req.type != "SMOKE_ALARM", true,
+            "${reasonCn}，系统自动暂停作业${if (req.detail.isNotBlank()) "：${req.detail}" else ""}", user.id)
+        setNightBlock(orderId, true, "${typeName}作业因${reasonCn}自动暂停，待安保重新现场复核")
+        event(orderId, "HOTWORK_AUTO_PAUSED",
+            "${typeName}票 #$permitId 作业中${reasonCn}，系统自动暂停；恢复动火须安保重新现场复核，不得沿用原审批", user.id)
+        notify(orderId, listOf("SECURITY", "FIRE", "MERCHANT"),
+            "${typeName}作业中${reasonCn}已自动暂停，请安保立即到场复核；当晚施工许可同步暂停")
+        MessageResp("已自动暂停动火作业并通知安保现场复核，当晚施工许可暂停")
+    }
+
     fun permitLifecycle(permitId: Long, finish: Boolean, user: AppUser): MessageResp = transaction {
         val p = SpecialWorkPermits.select { SpecialWorkPermits.id eq permitId }.firstOrNull()
             ?: throw ApiException(404, "作业票不存在")
         val orderId = p[SpecialWorkPermits.orderId]
         val o = orderRow(orderId)
         if (o[RenovationOrders.status] != "UNDER_CONSTRUCTION") throw ApiException(409, "装修单不在施工状态")
+        val typeName = RuleEngine.permitNames[p[SpecialWorkPermits.workType]]
         if (!finish) {
-            if (p[SpecialWorkPermits.status] != "APPROVED") throw ApiException(409, "仅已批准作业票可开工")
-            SpecialWorkPermits.update({ SpecialWorkPermits.id eq permitId }) { it[status] = "IN_PROGRESS" }
-            event(orderId, "PERMIT_STARTED", "${RuleEngine.permitNames[p[SpecialWorkPermits.workType]]}开始，看火人与灭火器材就位", user.id)
-            notify(orderId, listOf("FIRE", "SECURITY"), "${RuleEngine.permitNames[p[SpecialWorkPermits.workType]]}正在进行，请加强巡查")
-            MessageResp("作业已开始")
+            // 动火/切割：必须有与当前状态匹配的现场复核通过记录
+            if (p[SpecialWorkPermits.workType] in hotWorkTypes) {
+                when (p[SpecialWorkPermits.status]) {
+                    "APPROVED" -> if (p[SpecialWorkPermits.siteReviewStatus] != "PASSED")
+                        throw ApiException(409, "动火/切割开工前必须由安保完成现场复核（动火证/灭火器/监护人/烟感保护/营业时段）")
+                    "PAUSED" -> {
+                        val lastPause = PermitSiteLogs
+                            .select { (PermitSiteLogs.permitId eq permitId) and (PermitSiteLogs.action eq "ABNORMAL_PAUSE") }
+                            .maxByOrNull { it[PermitSiteLogs.id] }
+                        val recheck = if (lastPause == null) 0L else PermitSiteLogs.select {
+                            (PermitSiteLogs.permitId eq permitId) and
+                                (PermitSiteLogs.action eq "SITE_CHECK_PASS") and
+                                (PermitSiteLogs.id greater lastPause[PermitSiteLogs.id])
+                        }.count()
+                        if (recheck == 0L)
+                            throw ApiException(409, "动火被暂停后必须重新现场复核合格方可恢复，不得沿用原审批")
+                    }
+                    else -> throw ApiException(409, "当前状态 ${p[SpecialWorkPermits.status]} 不可开始/恢复动火作业")
+                }
+            } else {
+                if (p[SpecialWorkPermits.status] != "APPROVED") throw ApiException(409, "仅已批准作业票可开工")
+            }
+            val resuming = p[SpecialWorkPermits.status] == "PAUSED"
+            SpecialWorkPermits.update({ SpecialWorkPermits.id eq permitId }) {
+                it[status] = "IN_PROGRESS"
+                it[pausedReason] = null
+            }
+            siteLog(permitId, orderId, p[SpecialWorkPermits.siteReviewRound],
+                if (resuming) "RESUME_RECHECK_PASS" else "START",
+                true, true, true, true, true,
+                if (resuming) "重新复核合格后恢复动火作业" else "动火作业开始，消防措施就位", user.id)
+            event(orderId, if (resuming) "PERMIT_RESUMED" else "PERMIT_STARTED",
+                "${typeName}${if (resuming) "经重新现场复核后恢复作业" else "开始作业，监护人与灭火器材就位"}", user.id)
+            notify(orderId, listOf("FIRE", "SECURITY"), "${typeName}正在进行，请加强巡查")
+            MessageResp(if (resuming) "动火作业已恢复" else "作业已开始")
         } else {
             if (p[SpecialWorkPermits.status] != "IN_PROGRESS") throw ApiException(409, "仅进行中的作业票可完工")
             SpecialWorkPermits.update({ SpecialWorkPermits.id eq permitId }) { it[status] = "FINISHED" }
-            event(orderId, "PERMIT_FINISHED", "${RuleEngine.permitNames[p[SpecialWorkPermits.workType]]}结束，现场清理并确认无火种", user.id)
+            siteLog(permitId, orderId, p[SpecialWorkPermits.siteReviewRound], "FINISH",
+                true, true, true, true, true, "作业结束，现场清理并确认无火种", user.id)
+            event(orderId, "PERMIT_FINISHED", "${typeName}结束，现场清理并确认无火种", user.id)
+            if (o[RenovationOrders.nightWorkBlocked]) {
+                setNightBlock(orderId, false, "")
+                event(orderId, "NIGHT_WORK_RESTORED", "${typeName}安全结束，当晚施工许可恢复", user.id)
+            }
             MessageResp("作业已完工，现场已确认安全")
         }
     }
@@ -631,9 +852,9 @@ object Service {
         if (openIncidents > 0L) reasons += "存在 $openIncidents 起未闭环的施工事件"
         val activePermits = SpecialWorkPermits.select {
             (SpecialWorkPermits.orderId eq orderId) and
-                (SpecialWorkPermits.status inList listOf("APPLIED", "APPROVED", "IN_PROGRESS"))
+                (SpecialWorkPermits.status inList listOf("APPLIED", "APPROVED", "IN_PROGRESS", "PAUSED"))
         }.count()
-        if (activePermits > 0L) reasons += "存在 $activePermits 张未完工/未撤回的专项作业票"
+        if (activePermits > 0L) reasons += "存在 $activePermits 张未完工/暂停中/未撤回的专项作业票"
         if (reasons.isNotEmpty()) throw ApiException(409, "不具备完工报验条件：${reasons.joinToString("；")}")
 
         val categories = listOf("FIRE", "STRONG_ELECTRIC", "WEAK_ELECTRIC", "SMOKE_EXHAUST", "DRAINAGE", "STOREFRONT", "PUBLIC_RESTORE")

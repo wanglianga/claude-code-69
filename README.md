@@ -76,6 +76,25 @@ docker compose down -v       # 同时删除数据库卷
 ### 3. 专项作业票
 动火 `HOT_WORK`、切割 `CUTTING`、喷漆 `PAINTING`、高空 `HIGH_ALTITUDE` 必须单独申请；动火/切割强制看火人 + ≥2 具灭火器；消防/安保审批，作业有 申请→批准→进行中→完工 生命周期。
 
+#### 动火/切割现场复核闭环（安保）
+纸票审批通过不等于可动火，动火/切割开工前必须由安保完成**现场五项复核**：
+
+| 复核项 | 判定方式 |
+|---|---|
+| 动火证在场 | 安保现场核验 |
+| 灭火器就位（数量/压力） | 安保现场核验（申请阶段已强制 ≥2 具、指定看火人） |
+| 监护人（看火人）在岗 | 安保现场核验 |
+| 烟感保护到位（防护罩/隔离） | 安保现场核验 |
+| 作业避开商场营业时段 | **服务端按计划窗口与铺位营业时段（10:00–22:00）逐日强制判定**，不接受人为勾选 |
+
+- 复核五项全部满足才允许开工；任一项不合格返回 409，复核记录仍落库可追溯，并**暂停当晚施工许可**（门岗联动：许可暂停期间禁止再放行进施工人员）。
+- 开始（含恢复）、结束、异常全部写入 `permit_site_logs` 并回写装修单事件流。
+- **作业中烟感异常（`SMOKE_ALARM`）或监护人离岗（`WATCHER_LEAVE`）→ 系统自动暂停作业**（状态 `PAUSED`），通知安保立即到场复核，同步暂停当晚施工许可。
+- **暂停后恢复动火必须重新现场复核（复核轮次 +1），不能沿用原审批**；仅在存在"暂停之后"的新一轮复核通过记录时才允许恢复（`RESUME_RECHECK_PASS`）。
+- 作业安全结束或复核通过后，当晚施工许可自动恢复。
+
+相关接口：`POST /api/permits/{id}/site-review`（安保现场复核）、`POST /api/permits/{id}/abnormal`（烟感异常/监护人离岗，自动暂停）、`/api/permits/{id}/start|finish`。
+
 ### 4. 事件多方协同（同一装修单）
 超时、噪声、材料堆占通道、烟感被遮挡、喷淋改动、顾客投诉、临时改图 7 类事件：自动判定告警/违约等级、整改期限，通知涉及部门联合处置，可生成押金扣罚记录。
 - **临时改图**：自动追加物业/工程/消防/楼层运营改图复核任务，未通过不能完工报验。
@@ -184,6 +203,7 @@ curl -s -XPOST $BASE/api/orders/$OID/open -H "$auth"   # → 开业成功，装�
 ```bash
 BASE=http://host.docker.internal:$(docker compose port app 8080 | cut -d: -f2) python3 e2e/e2e_check.py
 BASE=http://host.docker.internal:$(docker compose port app 8080 | cut -d: -f2) python3 e2e/e2e_authz.py
+BASE=http://host.docker.internal:$(docker compose port app 8080 | cut -d: -f2) python3 e2e/e2e_hotwork.py
 ```
 
 ## 主要接口一览
@@ -201,6 +221,8 @@ BASE=http://host.docker.internal:$(docker compose port app 8080 | cut -d: -f2) p
 | POST | `/api/workers/verify` `/api/workers/{id}/admit` | 安保 | 五项核验、放行 |
 | POST | `/api/materials/gate` | 安保/消防 | 材料放行/拦截（阻燃抽检） |
 | POST | `/api/orders/{id}/permits` `/api/permits/{id}/decision|start|finish` | 商户/消防安保 | 专项作业票全生命周期 |
+| POST | `/api/permits/{id}/site-review` | 安保 | 动火/切割现场五项复核（营业时段服务端判定） |
+| POST | `/api/permits/{id}/abnormal` | 安保/消防/物业 | 烟感异常/监护人离岗 → 自动暂停，恢复须重新复核 |
 | POST | `/api/orders/{id}/incidents` `/api/incidents/{id}/handling|resolve` | 各管理部门 | 事件登记与多方闭环；闭环限事件责任部门（消防事件须 FIRE），商户 403 |
 | POST | `/api/orders/{id}/complete` `/api/orders/{id}/checks` | **仅本单商户**报验/主责部门验收 | 完工报验（非本单商户/管理角色 403）、7 项验收 |
 | POST | `/api/rectifications/submit` | 商户 | 整改提交复验 |

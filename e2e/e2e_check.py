@@ -123,6 +123,9 @@ pid = call("POST", f"/api/orders/{oid}/permits", M,
      "plannedEnd":"2026-09-22T02:00:00+08:00","fireWatcher":"刘看火","extinguisherCount":2}, expect=201)[1]["id"]
 call("POST", f"/api/permits/{pid}/decision", P, {"approved":True}, expect=403)  # 物业无权批动火
 call("POST", f"/api/permits/{pid}/decision", F, {"approved":True}, expect=200)
+# 开工前安保现场复核五项（夜间窗口避开营业时段）
+call("POST", f"/api/permits/{pid}/site-review", S,
+     {"permitPresent":True,"extinguisherOk":True,"watcherPresent":True,"smokeProtected":True}, expect=200)
 call("POST", f"/api/permits/{pid}/start", M, expect=200)
 call("POST", f"/api/permits/{pid}/finish", M, expect=200)
 
