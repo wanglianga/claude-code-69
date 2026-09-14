@@ -92,6 +92,8 @@ docker compose down -v       # 同时删除数据库卷
 - **作业中烟感异常（`SMOKE_ALARM`）或监护人离岗（`WATCHER_LEAVE`）→ 系统自动暂停作业**（状态 `PAUSED`），通知安保立即到场复核，同步暂停当晚施工许可。
 - **暂停后恢复动火必须重新现场复核（复核轮次 +1），不能沿用原审批**；仅在存在"暂停之后"的新一轮复核通过记录时才允许恢复（`RESUME_RECHECK_PASS`）。
 - 作业安全结束或复核通过后，当晚施工许可自动恢复。
+- **多张作业票并存时综合判定**：恢复当晚施工许可前，服务重算同一装修单内**所有动火/切割票**——只要存在暂停后未重新复核、或已批准但现场复核未通过的票，许可保持暂停；结束/复核任意单张票（含喷漆等非动火票结束）都不会误清其他暂停票的门岗限制。只有所有风险票均完成有效复核或安全结束（或被取消）才恢复，门岗放行与装修单事件流同步一致。
+- 已批准但不再作业的票可由商户/物业取消（`POST /api/permits/{id}/cancel`），取消后不参与动火风险评估。
 
 相关接口：`POST /api/permits/{id}/site-review`（安保现场复核）、`POST /api/permits/{id}/abnormal`（烟感异常/监护人离岗，自动暂停）、`/api/permits/{id}/start|finish`。
 
@@ -204,6 +206,7 @@ curl -s -XPOST $BASE/api/orders/$OID/open -H "$auth"   # → 开业成功，装�
 BASE=http://host.docker.internal:$(docker compose port app 8080 | cut -d: -f2) python3 e2e/e2e_check.py
 BASE=http://host.docker.internal:$(docker compose port app 8080 | cut -d: -f2) python3 e2e/e2e_authz.py
 BASE=http://host.docker.internal:$(docker compose port app 8080 | cut -d: -f2) python3 e2e/e2e_hotwork.py
+BASE=http://host.docker.internal:$(docker compose port app 8080 | cut -d: -f2) python3 e2e/e2e_multi_permit.py
 ```
 
 ## 主要接口一览
@@ -223,6 +226,7 @@ BASE=http://host.docker.internal:$(docker compose port app 8080 | cut -d: -f2) p
 | POST | `/api/orders/{id}/permits` `/api/permits/{id}/decision|start|finish` | 商户/消防安保 | 专项作业票全生命周期 |
 | POST | `/api/permits/{id}/site-review` | 安保 | 动火/切割现场五项复核（营业时段服务端判定） |
 | POST | `/api/permits/{id}/abnormal` | 安保/消防/物业 | 烟感异常/监护人离岗 → 自动暂停，恢复须重新复核 |
+| POST | `/api/permits/{id}/cancel` | 本单商户/物业 | 取消未开工票，取消后不参与动火风险评估 |
 | POST | `/api/orders/{id}/incidents` `/api/incidents/{id}/handling|resolve` | 各管理部门 | 事件登记与多方闭环；闭环限事件责任部门（消防事件须 FIRE），商户 403 |
 | POST | `/api/orders/{id}/complete` `/api/orders/{id}/checks` | **仅本单商户**报验/主责部门验收 | 完工报验（非本单商户/管理角色 403）、7 项验收 |
 | POST | `/api/rectifications/submit` | 商户 | 整改提交复验 |

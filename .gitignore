@@ -10,6 +10,9 @@ node_modules/
 !.env.example
 *.log
 logs/
+*.db
+*.sqlite
+*.sqlite3
 coverage/
 .cache/
 tmp/
@@ -22,6 +25,8 @@ skills/
 **/skills/
 .claude/
 .playwright-cli/
+sessions/
+session-logs/
 CLAUDE.md
 *_traces/
 traces/

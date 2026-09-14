@@ -519,6 +519,66 @@ object Service {
         }
     }
 
+    /**
+     * 综合判断同一装修单内所有动火/切割票的风险是否仍存在。
+     * 仅统计已授权进入现场环节的票（APPLIED/REJECTED/CANCELLED 尚未授权或已作废，不计）：
+     *  - PAUSED：暂停之后必须存在新一轮 SITE_CHECK_PASS（有效重新复核）才算解除，不能沿用原审批；
+     *  - APPROVED：现场复核未通过（FAILED/NONE）仍阻断；
+     *  - IN_PROGRESS：能进入进行中必先有效复核，不阻断；
+     *  - FINISHED：安全结束，不阻断。
+     * 返回 (是否仍应暂停当晚施工许可, 综合原因)。
+     */
+    private fun evaluateNightBlock(orderId: Long): Pair<Boolean, String> {
+        val permits = SpecialWorkPermits.select {
+            (SpecialWorkPermits.orderId eq orderId) and (SpecialWorkPermits.workType inList hotWorkTypes)
+        }.toList()
+        val blockers = mutableListOf<String>()
+        for (p in permits) {
+            val pid = p[SpecialWorkPermits.id]
+            val typeName = RuleEngine.permitNames[p[SpecialWorkPermits.workType]]
+            when (p[SpecialWorkPermits.status]) {
+                "PAUSED" -> {
+                    val lastPause = PermitSiteLogs.select {
+                        (PermitSiteLogs.permitId eq pid) and (PermitSiteLogs.action eq "ABNORMAL_PAUSE")
+                    }.maxByOrNull { it[PermitSiteLogs.id] }
+                    val rechecked = lastPause == null || PermitSiteLogs.select {
+                        (PermitSiteLogs.permitId eq pid) and
+                            (PermitSiteLogs.action eq "SITE_CHECK_PASS") and
+                            (PermitSiteLogs.id greater lastPause!![PermitSiteLogs.id])
+                    }.count() > 0L
+                    if (!rechecked) blockers += "${typeName}票 #$pid 暂停后尚未重新现场复核"
+                }
+                "APPROVED" -> {
+                    if (p[SpecialWorkPermits.siteReviewStatus] != "PASSED")
+                        blockers += "${typeName}票 #$pid 已批准但现场复核未通过/未完成"
+                }
+                else -> { /* IN_PROGRESS 持有效复核；FINISHED 安全结束；APPLIED/REJECTED/CANCELLED 未授权 */ }
+            }
+        }
+        return if (blockers.isEmpty()) false to ""
+        else true to "动火风险未解除：${blockers.joinToString("、")}"
+    }
+
+    /**
+     * 重算同单动火/切割风险并联动当晚施工许可；返回是否仍处于暂停。
+     * 只有所有风险票均完成有效复核或安全结束时才解除，避免一张票的结束/复核误清另一张暂停票的限制。
+     */
+    private fun reevaluateNightWork(orderId: Long, actorId: Long?): Boolean {
+        val (blocked, reason) = evaluateNightBlock(orderId)
+        val currentlyBlocked = orderRow(orderId)[RenovationOrders.nightWorkBlocked]
+        if (blocked) {
+            if (reason != orderRow(orderId)[RenovationOrders.nightBlockReason] || !currentlyBlocked) {
+                setNightBlock(orderId, true, reason)
+            }
+        } else if (currentlyBlocked) {
+            setNightBlock(orderId, false, "")
+            event(orderId, "NIGHT_WORK_RESTORED",
+                "同单所有动火/切割作业票均已完成有效复核或安全结束，当晚施工许可恢复", actorId)
+            notify(orderId, listOf("MERCHANT", "SECURITY"), "同单动火风险全部解除，当晚施工许可恢复")
+        }
+        return blocked
+    }
+
     /** 安保现场复核动火/切割条件：动火证、灭火器、监护人、烟感保护、营业时段 */
     fun siteReviewPermit(permitId: Long, req: SiteReviewReq, user: AppUser): MessageResp {
         // 复核失败也必须把记录/夜间许可联动落库，因此事务先提交、再在事务外抛出 409
@@ -578,12 +638,12 @@ object Service {
                     it[siteReviewerId] = user.id
                     it[siteReviewedAt] = Instant.now()
                 }
-                val reason = "动火现场复核未通过（${failedItems.joinToString("、")}），暂停当晚施工许可"
-                setNightBlock(orderId, true, reason)
                 event(orderId, "HOTWORK_SITE_REVIEW_FAIL",
                     "${typeName}票 #$permitId 第 $round 轮现场复核未通过：${failedItems.joinToString("、")}", user.id)
                 notify(orderId, listOf("MERCHANT", "SECURITY", "FIRE", "FLOOR_OPS"),
                     "${typeName}现场复核未通过，已暂停当晚施工许可，整改后须重新复核")
+                // 与同单其他动火/切割票综合重算（保留其他暂停票的门岗限制）
+                reevaluateNightWork(orderId, user.id)
                 false to "现场复核未通过：${failedItems.joinToString("、")}；当晚施工许可已暂停"
             } else {
                 SpecialWorkPermits.update({ SpecialWorkPermits.id eq permitId }) {
@@ -595,11 +655,8 @@ object Service {
                 }
                 event(orderId, "HOTWORK_SITE_REVIEW_PASS",
                     "${typeName}票 #$permitId 第 $round 轮现场复核通过：动火证/灭火器/监护人/烟感保护齐备且避开营业时段", user.id)
-                if (o[RenovationOrders.nightWorkBlocked]) {
-                    setNightBlock(orderId, false, "")
-                    event(orderId, "NIGHT_WORK_RESTORED", "动火现场复核（第 $round 轮）通过，当晚施工许可恢复", user.id)
-                    notify(orderId, listOf("MERCHANT", "SECURITY"), "动火现场条件复核合格，当晚施工许可恢复")
-                }
+                // 必须同单所有动火/切割票风险解除才恢复，不能因本票复核通过而误清其他暂停票
+                reevaluateNightWork(orderId, user.id)
                 true to (
                     if (resuming) "恢复复核通过（第 $round 轮，重新复核而非沿用原审批），可恢复动火作业"
                     else "现场复核通过（第 $round 轮），可开始动火作业"
@@ -632,7 +689,8 @@ object Service {
         siteLog(permitId, orderId, p[SpecialWorkPermits.siteReviewRound], "ABNORMAL_PAUSE",
             false, false, req.type != "WATCHER_LEAVE", req.type != "SMOKE_ALARM", true,
             "${reasonCn}，系统自动暂停作业${if (req.detail.isNotBlank()) "：${req.detail}" else ""}", user.id)
-        setNightBlock(orderId, true, "${typeName}作业因${reasonCn}自动暂停，待安保重新现场复核")
+        // 暂停本票并与同单其他动火/切割票综合重算
+        reevaluateNightWork(orderId, user.id)
         event(orderId, "HOTWORK_AUTO_PAUSED",
             "${typeName}票 #$permitId 作业中${reasonCn}，系统自动暂停；恢复动火须安保重新现场复核，不得沿用原审批", user.id)
         notify(orderId, listOf("SECURITY", "FIRE", "MERCHANT"),
@@ -689,12 +747,37 @@ object Service {
             siteLog(permitId, orderId, p[SpecialWorkPermits.siteReviewRound], "FINISH",
                 true, true, true, true, true, "作业结束，现场清理并确认无火种", user.id)
             event(orderId, "PERMIT_FINISHED", "${typeName}结束，现场清理并确认无火种", user.id)
-            if (o[RenovationOrders.nightWorkBlocked]) {
-                setNightBlock(orderId, false, "")
-                event(orderId, "NIGHT_WORK_RESTORED", "${typeName}安全结束，当晚施工许可恢复", user.id)
+            // 仅动火/切割票结束才参与当晚施工许可重算；喷漆/高空等非动火票结束不得清除动火风险限制
+            if (p[SpecialWorkPermits.workType] in hotWorkTypes) {
+                reevaluateNightWork(orderId, user.id)
             }
             MessageResp("作业已完工，现场已确认安全")
         }
+    }
+
+    /** 取消作业票（已批准未安全结束前，商户/物业可取消；取消后不参与动火风险评估，并重算当晚许可） */
+    fun cancelPermit(permitId: Long, user: AppUser): MessageResp = transaction {
+        if (user.role !in listOf("MERCHANT", "PROPERTY", "ADMIN"))
+            throw ApiException(403, "仅商户/物业可取消作业票")
+        val p = SpecialWorkPermits.select { SpecialWorkPermits.id eq permitId }.firstOrNull()
+            ?: throw ApiException(404, "作业票不存在")
+        if (p[SpecialWorkPermits.status] == "FINISHED") throw ApiException(409, "作业已安全结束，无需取消")
+        if (p[SpecialWorkPermits.status] == "CANCELLED") throw ApiException(409, "作业票已取消")
+        if (p[SpecialWorkPermits.status] == "IN_PROGRESS")
+            throw ApiException(409, "作业进行中不能直接取消，须先安全结束")
+        val orderId = p[SpecialWorkPermits.orderId]
+        if (user.role == "MERCHANT" && orderRow(orderId)[RenovationOrders.merchantUserId] != user.id)
+            throw ApiException(403, "仅本装修单商户可取消其作业票")
+        SpecialWorkPermits.update({ SpecialWorkPermits.id eq permitId }) {
+            it[status] = "CANCELLED"
+            it[pausedReason] = null
+        }
+        siteLog(permitId, orderId, p[SpecialWorkPermits.siteReviewRound], "CANCEL",
+            false, false, false, false, true, "作业票取消，不再纳入动火风险", user.id)
+        event(orderId, "PERMIT_CANCELLED",
+            "${RuleEngine.permitNames[p[SpecialWorkPermits.workType]]}票 #$permitId 已取消", user.id)
+        if (p[SpecialWorkPermits.workType] in hotWorkTypes) reevaluateNightWork(orderId, user.id)
+        MessageResp("作业票已取消")
     }
 
     // ---------- 施工事件（多方协同） ----------

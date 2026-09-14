@@ -128,6 +128,10 @@ fun Application.configureRouting() {
             post("/api/permits/{id}/abnormal") {
                 call.respond(Service.reportPermitAbnormal(call.parameters["id"]!!.toLong(), call.receive(), me))
             }
+            // 取消作业票（取消后不参与动火风险评估）
+            post("/api/permits/{id}/cancel") {
+                call.respond(Service.cancelPermit(call.parameters["id"]!!.toLong(), me))
+            }
 
             // 施工过程事件与多方处置
             post("/api/orders/{id}/incidents") {

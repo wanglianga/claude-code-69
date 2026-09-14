@@ -89,6 +89,10 @@ for f in ["idCardOk","badgeOk","insuranceOk","toolsOk","materialsOk"]:
     call("POST","/api/workers/verify", S, {"workerId":w2,f:True}, expect=200)
 c, b = call("POST", f"/api/workers/{w2}/admit", S, expect=409)
 check("夜间许可暂停联动门岗禁入", "施工许可已暂停" in b["error"], b)
+# 该白天动火票不再作业 → 取消后不参与风险评估，许可恢复
+call("POST", f"/api/permits/{pidA}/cancel", M, expect=200)
+_, d = permit_view(pidA)
+check("取消复核失败票后夜间许可恢复", d["summary"]["nightWorkBlocked"] is False, d["summary"])
 
 # ========== 场景 B：夜间窗口动火，缺监护人 → 恢复后通过 → 异常暂停 → 重新复核恢复 ==========
 pidB = apply_permit("HOT_WORK","2026-09-22T23:00:00+08:00","2026-09-23T02:00:00+08:00")
