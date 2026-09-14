@@ -1,0 +1,793 @@
+package com.mallrenovation.service
+
+import com.mallrenovation.engine.RuleEngine
+import com.mallrenovation.model.*
+import com.mallrenovation.security.Security
+import org.jetbrains.exposed.sql.*
+import org.jetbrains.exposed.sql.transactions.transaction
+import java.math.BigDecimal
+import java.time.Instant
+import java.time.ZoneId
+import java.time.temporal.ChronoUnit
+
+class ApiException(val code: Int, message: String) : RuntimeException(message)
+
+data class AppUser(val id: Long, val username: String, val displayName: String, val role: String) : io.ktor.server.auth.Principal
+
+object Service {
+
+    private val cnZone = ZoneId.of("Asia/Shanghai")
+
+    private fun ts(s: String): Instant = try {
+        Instant.parse(s)
+    } catch (e: Exception) {
+        throw ApiException(400, "时间格式错误（需 ISO-8601，如 2026-09-20T22:00:00+08:00）: $s")
+    }
+
+    private fun money(v: Double) = BigDecimal(v).setScale(2)
+
+    fun login(username: String, password: String): LoginResp = transaction {
+        val u = Users.select { Users.username eq username }.firstOrNull()
+            ?: throw ApiException(401, "用户名或密码错误")
+        if (!Security.verifyPassword(password, u[Users.passwordSalt], u[Users.passwordHash]))
+            throw ApiException(401, "用户名或密码错误")
+        LoginResp(
+            token = Security.issueToken(u[Users.id], u[Users.role]),
+            username = u[Users.username],
+            displayName = u[Users.displayName],
+            role = u[Users.role],
+            company = u[Users.company]
+        )
+    }
+
+    fun userById(id: Long): ResultRow =
+        Users.select { Users.id eq id }.firstOrNull() ?: throw ApiException(404, "用户不存在")
+
+    // ---------- 事件与通知 ----------
+    private fun event(orderId: Long, type: String, detail: String?, actorId: Long?) {
+        OrderEvents.insert {
+            it[OrderEvents.orderId] = orderId
+            it[eventType] = type
+            it[OrderEvents.detail] = detail
+            it[OrderEvents.actorId] = actorId
+            it[createdAt] = Instant.now()
+        }
+        RenovationOrders.update({ RenovationOrders.id eq orderId }) { it[updatedAt] = Instant.now() }
+    }
+
+    private fun notify(orderId: Long?, roles: List<String>, message: String) {
+        roles.distinct().forEach { role ->
+            Notifications.insert {
+                it[Notifications.orderId] = orderId
+                it[targetRole] = role
+                it[Notifications.message] = message
+                it[readFlag] = false
+                it[createdAt] = Instant.now()
+            }
+        }
+    }
+
+    // ---------- 铺位 ----------
+    fun listShops(): List<ShopView> = transaction {
+        Shops.selectAll().orderBy(Shops.code).map {
+            ShopView(
+                it[Shops.id], it[Shops.code], it[Shops.name], it[Shops.floor],
+                it[Shops.category], it[Shops.adjacentShopCodes],
+                it[Shops.operatingStart], it[Shops.operatingEnd]
+            )
+        }
+    }
+
+    // ---------- 装修申请 ----------
+    fun createOrder(req: CreateOrderReq, user: AppUser): OrderSummary = transaction {
+        if (user.role != "MERCHANT") throw ApiException(403, "仅商户可提交装修申请")
+        val shop = Shops.select { Shops.code eq req.shopCode }.firstOrNull()
+            ?: throw ApiException(400, "铺位不存在: ${req.shopCode}")
+        if (req.scenario !in RuleEngine.scenarioNames.keys) throw ApiException(400, "未知装修场景: ${req.scenario}")
+        if (req.workers.isEmpty()) throw ApiException(400, "必须提交施工人员名单")
+        if (req.materials.isEmpty()) throw ApiException(400, "必须提交材料清单")
+        if (req.enclosurePlan.isBlank()) throw ApiException(400, "必须提交围挡方案")
+        if (req.constructionCompany.isBlank()) throw ApiException(400, "必须填写施工单位")
+
+        val start = ts(req.constructionStart)
+        val end = ts(req.constructionEnd)
+        if (!end.isAfter(start)) throw ApiException(400, "施工结束时间必须晚于开始时间")
+
+        val adjacent = shop[Shops.adjacentShopCodes].split(",").map { it.trim() }.filter { it.isNotEmpty() }
+        val overlap = overlapsOperatingHours(start, end, shop[Shops.operatingStart], shop[Shops.operatingEnd])
+
+        val rule = RuleEngine.evaluate(
+            scenario = req.scenario,
+            category = shop[Shops.category],
+            floor = shop[Shops.floor],
+            adjacent = adjacent,
+            overlapsOperatingHours = overlap,
+            hotWork = req.hotWorkRequired,
+            nightWork = req.nightWorkRequired
+        )
+
+        val now = Instant.now()
+        val orderNo = "RG${java.time.format.DateTimeFormatter.ofPattern("yyyyMMddHHmmss").withZone(cnZone).format(now)}${(100..999).random()}"
+        val orderId = RenovationOrders.insert {
+            it[RenovationOrders.orderNo] = orderNo
+            it[shopId] = shop[Shops.id]
+            it[merchantUserId] = user.id
+            it[scenario] = req.scenario
+            it[status] = "PENDING_REVIEW"
+            it[drawingDoc] = req.drawingDoc
+            it[constructionStart] = start
+            it[constructionEnd] = end
+            it[constructionCompany] = req.constructionCompany
+            it[hotWorkRequired] = req.hotWorkRequired
+            it[nightWorkRequired] = req.nightWorkRequired
+            it[enclosurePlan] = req.enclosurePlan
+            it[depositAmount] = rule.deposit
+            it[createdAt] = now
+            it[updatedAt] = now
+        } get RenovationOrders.id
+
+        rule.tasks.forEach { spec ->
+            ApprovalTasks.insert {
+                it[ApprovalTasks.orderId] = orderId
+                it[ApprovalTasks.dept] = spec.dept
+                it[ApprovalTasks.title] = spec.title
+                it[ApprovalTasks.seq] = spec.seq
+                it[ApprovalTasks.status] = "PENDING"
+                it[ApprovalTasks.createdAt] = now
+            }
+        }
+
+        req.workers.forEach { w ->
+            Workers.insert {
+                it[Workers.orderId] = orderId
+                it[Workers.name] = w.name
+                it[Workers.idCard] = w.idCard
+            }
+        }
+        req.materials.forEach { m ->
+            MaterialItems.insert {
+                it[MaterialItems.orderId] = orderId
+                it[MaterialItems.name] = m.name
+                it[MaterialItems.qty] = m.qty
+                it[MaterialItems.declaredFlameRetardant] = m.declaredFlameRetardant
+            }
+        }
+
+        event(orderId, "ORDER_SUBMITTED", "商户提交${RuleEngine.scenarioNames[req.scenario]}申请；规则引擎生成${rule.tasks.size}项审批任务，押金基准 ¥${rule.deposit}", user.id)
+        rule.notes.forEach { event(orderId, "RULE_NOTE", it, null) }
+        event(orderId, "RULE_NOISE", "噪声限制：${rule.noiseRule}", null)
+        event(orderId, "RULE_MATERIAL", "材料管控：${rule.materialRule}", null)
+        event(orderId, "RULE_FIRE", "消防要求：${rule.fireRule}", null)
+
+        val roleMsg = "新装修单 $orderNo（${shop[Shops.name]} ${req.shopCode}）待审批"
+        notify(orderId, listOf("PROPERTY", "ENGINEERING", "FIRE", "SECURITY", "FINANCE", "FLOOR_OPS"), roleMsg)
+        if (overlap) {
+            notify(orderId, listOf("FLOOR_OPS"), "装修单 $orderNo 施工与营业时段重叠，请评估对邻近商户${adjacent.joinToString("、")}收入及顾客动线影响")
+        }
+
+        summary(orderId)
+    }
+
+    /** 施工周期是否覆盖营业时段：超过 12 小时视为跨营业时段；否则按起止小时判断 */
+    private fun overlapsOperatingHours(start: Instant, end: Instant, opStart: Int, opEnd: Int): Boolean {
+        val hours = ChronoUnit.HOURS.between(start, end)
+        if (hours >= 12) return true
+        val s = start.atZone(cnZone).hour
+        val e = end.atZone(cnZone).hour.coerceAtMost(23)
+        return (s < opEnd && e > opStart)
+    }
+
+    // ---------- 查询 ----------
+    private fun orderRow(id: Long): ResultRow =
+        RenovationOrders.select { RenovationOrders.id eq id }.firstOrNull()
+            ?: throw ApiException(404, "装修单不存在")
+
+    private fun shopRow(id: Long): ResultRow = Shops.select { Shops.id eq id }.first()
+    private fun userName(id: Long?): String? = id?.let { Users.select { Users.id eq it }.firstOrNull()?.get(Users.displayName) }
+
+    fun listOrders(user: AppUser): List<OrderSummary> = transaction {
+        val rows = if (user.role == "MERCHANT")
+            RenovationOrders.select { RenovationOrders.merchantUserId eq user.id }.orderBy(RenovationOrders.id, SortOrder.DESC).toList()
+        else
+            RenovationOrders.selectAll().orderBy(RenovationOrders.id, SortOrder.DESC).toList()
+        rows.map { summaryRow(it) }
+    }
+
+    private fun summaryRow(o: ResultRow): OrderSummary {
+        val shop = shopRow(o[RenovationOrders.shopId])
+        return OrderSummary(
+            id = o[RenovationOrders.id],
+            orderNo = o[RenovationOrders.orderNo],
+            shopCode = shop[Shops.code],
+            shopName = shop[Shops.name],
+            floor = shop[Shops.floor],
+            scenario = o[RenovationOrders.scenario],
+            status = o[RenovationOrders.status],
+            depositAmount = o[RenovationOrders.depositAmount].toDouble(),
+            depositPaid = o[RenovationOrders.depositPaid],
+            totalPenalty = o[RenovationOrders.totalPenalty].toDouble(),
+            fireReinspectionPassed = o[RenovationOrders.fireReinspectionPassed],
+            firePermitPassed = o[RenovationOrders.firePermitPassed],
+            openingAllowed = o[RenovationOrders.openingAllowed],
+            createdAt = o[RenovationOrders.createdAt].toString()
+        )
+    }
+
+    private fun summary(id: Long): OrderSummary = summaryRow(orderRow(id))
+
+    fun getOrder(id: Long): OrderDetail = transaction {
+        val o = orderRow(id)
+        val tasks = ApprovalTasks.select { ApprovalTasks.orderId eq id }.orderBy(ApprovalTasks.seq).map {
+            TaskView(it[ApprovalTasks.id], it[ApprovalTasks.dept], it[ApprovalTasks.title],
+                it[ApprovalTasks.status], userName(it[ApprovalTasks.reviewerId]), it[ApprovalTasks.comment], it[ApprovalTasks.seq])
+        }
+        val workers = Workers.select { Workers.orderId eq id }.orderBy(Workers.id).map {
+            val ready = it[Workers.idCardOk] && it[Workers.badgeOk] && it[Workers.insuranceOk] && it[Workers.toolsOk] && it[Workers.materialsOk]
+            WorkerView(it[Workers.id], it[Workers.name], it[Workers.idCard],
+                it[Workers.idCardOk], it[Workers.badgeOk], it[Workers.insuranceOk],
+                it[Workers.toolsOk], it[Workers.materialsOk], ready, it[Workers.admitted],
+                it[Workers.admitTime]?.toString())
+        }
+        val materials = MaterialItems.select { MaterialItems.orderId eq id }.orderBy(MaterialItems.id).map {
+            MaterialView(it[MaterialItems.id], it[MaterialItems.name], it[MaterialItems.qty],
+                it[MaterialItems.declaredFlameRetardant], it[MaterialItems.flameRetardantVerified],
+                it[MaterialItems.entryStatus], it[MaterialItems.gateRemark])
+        }
+        val permits = SpecialWorkPermits.select { SpecialWorkPermits.orderId eq id }.orderBy(SpecialWorkPermits.id).map {
+            PermitView(it[SpecialWorkPermits.id], it[SpecialWorkPermits.workType], it[SpecialWorkPermits.reason],
+                it[SpecialWorkPermits.plannedStart].toString(), it[SpecialWorkPermits.plannedEnd].toString(),
+                it[SpecialWorkPermits.status], it[SpecialWorkPermits.fireWatcher], it[SpecialWorkPermits.extinguisherCount],
+                userName(it[SpecialWorkPermits.approverId]), it[SpecialWorkPermits.decidedAt]?.toString())
+        }
+        val incidents = Incidents.select { Incidents.orderId eq id }.orderBy(Incidents.id).map {
+            val parties = RuleEngine.incidentParties[it[Incidents.type]] ?: emptyList()
+            IncidentView(it[Incidents.id], it[Incidents.type], it[Incidents.level], it[Incidents.description],
+                userName(it[Incidents.reportedBy]), it[Incidents.penalty].toDouble(),
+                it[Incidents.rectifyDeadline]?.toString(), it[Incidents.status],
+                parties.map { p -> RuleEngine.deptNames[p] ?: p }, it[Incidents.createdAt].toString())
+        }
+        val penalties = Penalties.select { Penalties.orderId eq id }.orderBy(Penalties.id).map {
+            PenaltyView(it[Penalties.id], it[Penalties.incidentId], it[Penalties.amount].toDouble(),
+                it[Penalties.reason], it[Penalties.deducted])
+        }
+        val items = AcceptanceItems.select { AcceptanceItems.orderId eq id }.orderBy(AcceptanceItems.id).map {
+            CheckItemView(it[AcceptanceItems.id], it[AcceptanceItems.category], it[AcceptanceItems.status],
+                userName(it[AcceptanceItems.inspectorId]), it[AcceptanceItems.remark], it[AcceptanceItems.checkedAt]?.toString())
+        }
+        val rects = Rectifications.select { Rectifications.orderId eq id }.orderBy(Rectifications.id).map {
+            RectificationView(it[Rectifications.id], it[Rectifications.itemId], it[Rectifications.description],
+                it[Rectifications.deadline].toString(), it[Rectifications.status], it[Rectifications.submittedNote],
+                it[Rectifications.createdAt].toString(), it[Rectifications.resolvedAt]?.toString())
+        }
+        val events = OrderEvents.select { OrderEvents.orderId eq id }.orderBy(OrderEvents.id).map {
+            EventView(it[OrderEvents.id], it[OrderEvents.eventType], it[OrderEvents.detail],
+                userName(it[OrderEvents.actorId]), it[OrderEvents.createdAt].toString())
+        }
+        OrderDetail(summaryRow(o), tasks, workers, materials, permits, incidents, penalties, items, rects, events)
+    }
+
+    // ---------- 审批 ----------
+    fun reviewTask(taskId: Long, approved: Boolean, comment: String, user: AppUser): MessageResp = transaction {
+        val t = ApprovalTasks.select { ApprovalTasks.id eq taskId }.firstOrNull()
+            ?: throw ApiException(404, "审批任务不存在")
+        if (t[ApprovalTasks.dept] != user.role && user.role != "ADMIN")
+            throw ApiException(403, "该任务由 ${RuleEngine.deptNames[t[ApprovalTasks.dept]]} 审核")
+        if (t[ApprovalTasks.status] != "PENDING") throw ApiException(409, "该任务已审核")
+        val orderId = t[ApprovalTasks.orderId]
+        val o = orderRow(orderId)
+        if (o[RenovationOrders.status] in listOf("CANCELLED", "OPENED"))
+            throw ApiException(409, "装修单当前状态不可审核")
+
+        ApprovalTasks.update({ ApprovalTasks.id eq taskId }) {
+            it[status] = if (approved) "APPROVED" else "REJECTED"
+            it[reviewerId] = user.id
+            it[ApprovalTasks.comment] = comment
+            it[reviewedAt] = Instant.now()
+        }
+        event(orderId, "TASK_REVIEWED",
+            "${RuleEngine.deptNames[t[ApprovalTasks.dept]]}${if (approved) "通过" else "驳回"}：${t[ApprovalTasks.title]}" +
+                (if (comment.isNotBlank()) "（$comment）" else ""), user.id)
+
+        if (!approved) {
+            RenovationOrders.update({ RenovationOrders.id eq orderId }) { it[status] = "REJECTED" }
+            event(orderId, "ORDER_REJECTED", "审批被驳回，商户修改后需重新申报", user.id)
+            notify(orderId, listOf("MERCHANT"), "装修单 ${o[RenovationOrders.orderNo]} 被${RuleEngine.deptNames[t[ApprovalTasks.dept]]}驳回：$comment")
+            return@transaction MessageResp("已驳回，装修单退回商户")
+        }
+
+        val pending = ApprovalTasks.select { (ApprovalTasks.orderId eq orderId) and (ApprovalTasks.status eq "PENDING") }.count()
+        if (pending == 0L) {
+            notify(orderId, listOf("MERCHANT", "FLOOR_OPS"),
+                "装修单 ${o[RenovationOrders.orderNo]} 六方会签全部通过；商户缴纳押金后可办理施工证进场")
+            event(orderId, "ALL_TASKS_APPROVED", "物业/工程/消防/安保/财务/楼层运营全部会签通过", user.id)
+        } else {
+            notify(orderId, listOf("MERCHANT"), "审批节点通过（${RuleEngine.deptNames[t[ApprovalTasks.dept]]}），剩余 $pending 项待审")
+        }
+        MessageResp("审核通过，剩余待审任务 $pending 项")
+    }
+
+    // ---------- 押金 / 施工证 ----------
+    fun payDeposit(orderId: Long, user: AppUser): MessageResp = transaction {
+        val o = orderRow(orderId)
+        if (o[RenovationOrders.merchantUserId] != user.id) throw ApiException(403, "仅本单商户可缴纳押金")
+        if (o[RenovationOrders.depositPaid]) throw ApiException(409, "押金已缴纳")
+        RenovationOrders.update({ RenovationOrders.id eq orderId }) { it[depositPaid] = true }
+        event(orderId, "DEPOSIT_PAID", "商户缴纳装修押金 ¥${o[RenovationOrders.depositAmount]}，待财务确认到账", user.id)
+        notify(orderId, listOf("FINANCE"), "装修单 ${o[RenovationOrders.orderNo]} 押金 ¥${o[RenovationOrders.depositAmount]} 待确认")
+        MessageResp("押金缴纳凭证已提交，等待财务确认")
+    }
+
+    fun startConstruction(orderId: Long, user: AppUser): MessageResp = transaction {
+        val o = orderRow(orderId)
+        if (o[RenovationOrders.status] != "PENDING_REVIEW")
+            throw ApiException(409, "当前状态 ${o[RenovationOrders.status]} 不可开工")
+        val pending = ApprovalTasks.select { (ApprovalTasks.orderId eq orderId) and (ApprovalTasks.status neq "APPROVED") }.count()
+        val reasons = mutableListOf<String>()
+        if (pending > 0L) reasons += "尚有 $pending 项审批任务未通过（六方会签未完成）"
+        if (!o[RenovationOrders.depositPaid]) reasons += "装修押金未缴纳"
+        if (reasons.isNotEmpty()) throw ApiException(409, "不满足开工条件：${reasons.joinToString("；")}")
+
+        RenovationOrders.update({ RenovationOrders.id eq orderId }) { it[status] = "UNDER_CONSTRUCTION" }
+        event(orderId, "CONSTRUCTION_STARTED", "施工证生效，施工单位 ${o[RenovationOrders.constructionCompany]} 凭证进场", user.id)
+        notify(orderId, listOf("MERCHANT", "SECURITY", "FLOOR_OPS"),
+            "装修单 ${o[RenovationOrders.orderNo]} 施工证已生效，安保门岗启动人员/材料核验")
+        MessageResp("施工证已生效，可进场施工")
+    }
+
+    // ---------- 人员进场核验 ----------
+    fun verifyWorker(req: WorkerVerifyReq, user: AppUser): MessageResp = transaction {
+        if (user.role !in listOf("SECURITY", "ADMIN")) throw ApiException(403, "仅安保可进行进场核验")
+        val w = Workers.select { Workers.id eq req.workerId }.firstOrNull()
+            ?: throw ApiException(404, "施工人员不存在")
+        Workers.update({ Workers.id eq req.workerId }) {
+            req.idCardOk?.let { v -> it[idCardOk] = v }
+            req.badgeOk?.let { v -> it[badgeOk] = v }
+            req.insuranceOk?.let { v -> it[insuranceOk] = v }
+            req.toolsOk?.let { v -> it[toolsOk] = v }
+            req.materialsOk?.let { v -> it[materialsOk] = v }
+        }
+        val fresh = Workers.select { Workers.id eq req.workerId }.first()
+        val ready = fresh[Workers.idCardOk] && fresh[Workers.badgeOk] && fresh[Workers.insuranceOk] &&
+            fresh[Workers.toolsOk] && fresh[Workers.materialsOk]
+        event(fresh[Workers.orderId], "WORKER_VERIFIED",
+            "安保核验人员 ${fresh[Workers.name]}：身份证=${yn(fresh[Workers.idCardOk])} 工牌=${yn(fresh[Workers.badgeOk])} " +
+                "保险=${yn(fresh[Workers.insuranceOk])} 工具=${yn(fresh[Workers.toolsOk])} 材料=${yn(fresh[Workers.materialsOk])}", user.id)
+        MessageResp(if (ready) "五项核验全部通过，可放行进场" else "核验信息已更新，尚有项目未通过，不可进场")
+    }
+
+    fun admitWorker(workerId: Long, user: AppUser): MessageResp = transaction {
+        if (user.role !in listOf("SECURITY", "ADMIN")) throw ApiException(403, "仅安保可放行")
+        val w = Workers.select { Workers.id eq workerId }.firstOrNull() ?: throw ApiException(404, "施工人员不存在")
+        val orderId = w[Workers.orderId]
+        val o = orderRow(orderId)
+        if (o[RenovationOrders.status] != "UNDER_CONSTRUCTION")
+            throw ApiException(409, "装修单未在施工状态，施工证未生效，禁止进场")
+        val ready = w[Workers.idCardOk] && w[Workers.badgeOk] && w[Workers.insuranceOk] && w[Workers.toolsOk] && w[Workers.materialsOk]
+        if (!ready) throw ApiException(409, "身份证/工牌/保险/工具/材料五项核验未全部通过，禁止进场")
+        if (w[Workers.admitted]) throw ApiException(409, "该人员已进场")
+        Workers.update({ Workers.id eq workerId }) {
+            it[admitted] = true
+            it[admitTime] = Instant.now()
+        }
+        event(orderId, "WORKER_ADMITTED", "施工人员 ${w[Workers.name]} 核验合格放行进场", user.id)
+        MessageResp("放行成功：${w[Workers.name]} 已进场")
+    }
+
+    private fun yn(b: Boolean) = if (b) "✓" else "✗"
+
+    // ---------- 材料出入 ----------
+    fun materialGate(req: MaterialGateReq, user: AppUser): MessageResp = transaction {
+        if (user.role !in listOf("SECURITY", "FIRE", "ADMIN")) throw ApiException(403, "仅安保/消防可核验材料")
+        val m = MaterialItems.select { MaterialItems.id eq req.materialId }.firstOrNull()
+            ?: throw ApiException(404, "材料不存在")
+        if (req.allow && m[MaterialItems.declaredFlameRetardant] && !req.flameRetardantVerified)
+            throw ApiException(409, "申报阻燃材料必须现场抽检合格后方可进场")
+        MaterialItems.update({ MaterialItems.id eq req.materialId }) {
+            it[entryStatus] = if (req.allow) "ALLOWED" else "REJECTED"
+            it[flameRetardantVerified] = req.flameRetardantVerified || m[MaterialItems.flameRetardantVerified]
+            it[gateRemark] = req.remark.ifBlank { if (req.allow) "核验放行" else "禁止进场" }
+        }
+        event(m[MaterialItems.orderId], "MATERIAL_GATE",
+            "材料 ${m[MaterialItems.name]}（${m[MaterialItems.qty]}）${if (req.allow) "放行进场" else "被门岗拒绝进场"}" +
+                (if (req.remark.isNotBlank()) "：${req.remark}" else ""), user.id)
+        if (!req.allow) notify(m[MaterialItems.orderId], listOf("MERCHANT"),
+            "材料 ${m[MaterialItems.name]} 被禁止入场：${req.remark}")
+        MessageResp(if (req.allow) "材料已放行" else "材料已拦截")
+    }
+
+    // ---------- 专项作业票 ----------
+    fun applyPermit(orderId: Long, req: PermitApplyReq, user: AppUser): PermitView = transaction {
+        if (user.role !in listOf("MERCHANT", "PROPERTY", "ADMIN")) throw ApiException(403, "仅商户/物业可申请专项作业票")
+        if (req.workType !in RuleEngine.permitNames.keys) throw ApiException(400, "未知作业类型")
+        val o = orderRow(orderId)
+        if (o[RenovationOrders.status] != "UNDER_CONSTRUCTION")
+            throw ApiException(409, "仅施工中可办理专项作业票（动火/切割/喷漆/高空作业必须单独申请）")
+        val start = ts(req.plannedStart); val end = ts(req.plannedEnd)
+        if (!end.isAfter(start)) throw ApiException(400, "作业结束时间必须晚于开始时间")
+        if (req.workType in listOf("HOT_WORK", "CUTTING") && (req.fireWatcher.isBlank() || req.extinguisherCount < 2))
+            throw ApiException(400, "动火/切割作业必须指定看火人且配置不少于 2 具灭火器")
+
+        val id = SpecialWorkPermits.insert {
+            it[SpecialWorkPermits.orderId] = orderId
+            it[workType] = req.workType
+            it[reason] = req.reason
+            it[plannedStart] = start
+            it[plannedEnd] = end
+            it[fireWatcher] = req.fireWatcher.ifBlank { null }
+            it[extinguisherCount] = req.extinguisherCount
+            it[status] = "APPLIED"
+            it[createdAt] = Instant.now()
+        } get SpecialWorkPermits.id
+        event(orderId, "PERMIT_APPLIED", "${RuleEngine.permitNames[req.workType]}票申请：${req.reason}", user.id)
+        notify(orderId, listOf("FIRE", "SECURITY"), "装修单 ${o[RenovationOrders.orderNo]} 申请${RuleEngine.permitNames[req.workType]}票，待审批")
+        PermitView(id, req.workType, req.reason, start.toString(), end.toString(), "APPLIED",
+            req.fireWatcher.ifBlank { null }, req.extinguisherCount)
+    }
+
+    fun decidePermit(permitId: Long, approved: Boolean, comment: String, user: AppUser): MessageResp = transaction {
+        if (user.role !in listOf("FIRE", "SECURITY", "ADMIN")) throw ApiException(403, "专项作业票由消防维保/安保审批")
+        val p = SpecialWorkPermits.select { SpecialWorkPermits.id eq permitId }.firstOrNull()
+            ?: throw ApiException(404, "作业票不存在")
+        if (p[SpecialWorkPermits.status] != "APPLIED") throw ApiException(409, "作业票已审批")
+        SpecialWorkPermits.update({ SpecialWorkPermits.id eq permitId }) {
+            it[status] = if (approved) "APPROVED" else "REJECTED"
+            it[approverId] = user.id
+            it[decidedAt] = Instant.now()
+        }
+        event(p[SpecialWorkPermits.orderId], "PERMIT_DECIDED",
+            "${RuleEngine.permitNames[p[SpecialWorkPermits.workType]]}票${if (approved) "批准" else "驳回"}" +
+                (if (comment.isNotBlank()) "：$comment" else ""), user.id)
+        notify(p[SpecialWorkPermits.orderId], listOf("MERCHANT", "SECURITY"),
+            "${RuleEngine.permitNames[p[SpecialWorkPermits.workType]]}票${if (approved) "已批准，作业前现场确认消防措施" else "被驳回：$comment"}")
+        MessageResp(if (approved) "作业票已批准" else "作业票已驳回")
+    }
+
+    fun permitLifecycle(permitId: Long, finish: Boolean, user: AppUser): MessageResp = transaction {
+        val p = SpecialWorkPermits.select { SpecialWorkPermits.id eq permitId }.firstOrNull()
+            ?: throw ApiException(404, "作业票不存在")
+        val orderId = p[SpecialWorkPermits.orderId]
+        val o = orderRow(orderId)
+        if (o[RenovationOrders.status] != "UNDER_CONSTRUCTION") throw ApiException(409, "装修单不在施工状态")
+        if (!finish) {
+            if (p[SpecialWorkPermits.status] != "APPROVED") throw ApiException(409, "仅已批准作业票可开工")
+            SpecialWorkPermits.update({ SpecialWorkPermits.id eq permitId }) { it[status] = "IN_PROGRESS" }
+            event(orderId, "PERMIT_STARTED", "${RuleEngine.permitNames[p[SpecialWorkPermits.workType]]}开始，看火人与灭火器材就位", user.id)
+            notify(orderId, listOf("FIRE", "SECURITY"), "${RuleEngine.permitNames[p[SpecialWorkPermits.workType]]}正在进行，请加强巡查")
+            MessageResp("作业已开始")
+        } else {
+            if (p[SpecialWorkPermits.status] != "IN_PROGRESS") throw ApiException(409, "仅进行中的作业票可完工")
+            SpecialWorkPermits.update({ SpecialWorkPermits.id eq permitId }) { it[status] = "FINISHED" }
+            event(orderId, "PERMIT_FINISHED", "${RuleEngine.permitNames[p[SpecialWorkPermits.workType]]}结束，现场清理并确认无火种", user.id)
+            MessageResp("作业已完工，现场已确认安全")
+        }
+    }
+
+    // ---------- 施工事件（多方协同） ----------
+    fun reportIncident(orderId: Long, req: IncidentReq, user: AppUser): IncidentView = transaction {
+        if (user.role !in listOf("PROPERTY", "ENGINEERING", "SECURITY", "FIRE", "FLOOR_OPS", "ADMIN"))
+            throw ApiException(403, "仅物业/工程/安保/消防/楼层运营可上报施工事件")
+        if (req.type !in RuleEngine.incidentLevel.keys) throw ApiException(400, "未知事件类型")
+        val o = orderRow(orderId)
+        if (o[RenovationOrders.status] !in listOf("UNDER_CONSTRUCTION", "COMPLETED_PENDING_ACCEPTANCE", "RECTIFICATION"))
+            throw ApiException(409, "仅施工/验收阶段可登记事件")
+        val level = RuleEngine.incidentLevel[req.type]!!
+        val deadline = req.rectifyDeadline?.let { ts(it) }
+            ?: if (level == "BREACH") Instant.now().plus(3, ChronoUnit.DAYS) else null
+        val amount = money(req.penalty)
+
+        val id = Incidents.insert {
+            it[Incidents.orderId] = orderId
+            it[type] = req.type
+            it[Incidents.level] = level
+            it[description] = req.description
+            it[reportedBy] = user.id
+            it[penalty] = amount
+            it[rectifyDeadline] = deadline
+            it[status] = "OPEN"
+            it[createdAt] = Instant.now()
+        } get Incidents.id
+
+        if (amount > BigDecimal.ZERO) {
+            Penalties.insert {
+                it[Penalties.orderId] = orderId
+                it[incidentId] = id
+                it[Penalties.amount] = amount
+                it[reason] = "${RuleEngine.incidentNames[req.type]}扣罚：${req.description}"
+                it[deducted] = false
+                it[createdBy] = user.id
+                it[createdAt] = Instant.now()
+            }
+            RenovationOrders.update({ RenovationOrders.id eq orderId }) {
+                it[updatedAt] = Instant.now()
+            }
+        }
+
+        event(orderId, "INCIDENT_REPORTED",
+            "【${RuleEngine.incidentNames[req.type]}】${if (level == "BREACH") "（违约）" else ""}${req.description}" +
+                (if (amount > BigDecimal.ZERO) "；拟扣罚 ¥$amount（待财务执行）" else "") +
+                (deadline?.let { d -> "；整改期限 $d" } ?: ""), user.id)
+
+        val parties = RuleEngine.incidentParties[req.type] ?: emptyList()
+        notify(orderId, parties + "MERCHANT",
+            "装修单 ${o[RenovationOrders.orderNo]} 发生【${RuleEngine.incidentNames[req.type]}】，多部门联合处置：${req.description}")
+
+        // 临时改图 → 生成改图复核任务，未复核通过不得完工
+        if (req.type == "TEMP_DRAWING_CHANGE") {
+            listOf(Triple("PROPERTY", "临时改图复核：物业确认围挡与公共区域方案", 1),
+                Triple("ENGINEERING", "临时改图复核：工程部确认强弱电/管线影响", 2),
+                Triple("FIRE", "临时改图复核：消防确认喷淋烟感与疏散影响", 3),
+                Triple("FLOOR_OPS", "临时改图复核：楼层运营确认动线与邻里影响", 5)).forEach { (dept, title, seq) ->
+                ApprovalTasks.insert {
+                    it[ApprovalTasks.orderId] = orderId
+                    it[ApprovalTasks.dept] = dept
+                    it[ApprovalTasks.title] = title
+                    it[ApprovalTasks.seq] = seq
+                    it[status] = "PENDING"
+                    it[createdAt] = Instant.now()
+                }
+            }
+            event(orderId, "CHANGE_CONTROL", "临时改图触发变更管控：物业/工程/消防/楼层运营须重新复核，未通过不得完工", user.id)
+        }
+
+        // 烟感遮挡/喷淋改动 → 消防开业许可作废，须修复复验
+        if (req.type in listOf("SMOKE_COVERED", "SPRINKLER_MODIFICATION")) {
+            RenovationOrders.update({ RenovationOrders.id eq orderId }) {
+                it[firePermitPassed] = false
+                it[openingAllowed] = false
+                it[fireReinspectionPassed] = false
+            }
+            event(orderId, "FIRE_PERMIT_SUSPENDED", "消防设施受影响，消防许可冻结，修复并经消防维保复验前禁止开业", user.id)
+            notify(orderId, listOf("MERCHANT", "PROPERTY"), "消防许可已冻结：${RuleEngine.incidentNames[req.type]}必须先整改复验")
+        }
+
+        IncidentView(id, req.type, level, req.description, user.displayName, amount.toDouble(),
+            deadline?.toString(), "OPEN",
+            parties.map { RuleEngine.deptNames[it] ?: it }, Instant.now().toString())
+    }
+
+    fun incidentStatus(id: Long, resolve: Boolean, user: AppUser): MessageResp = transaction {
+        val inc = Incidents.select { Incidents.id eq id }.firstOrNull() ?: throw ApiException(404, "事件不存在")
+        val orderId = inc[Incidents.orderId]
+        if (!resolve) {
+            if (inc[Incidents.status] != "OPEN") throw ApiException(409, "事件已在处置中")
+            Incidents.update({ Incidents.id eq id }) { it[status] = "HANDLING" }
+            event(orderId, "INCIDENT_HANDLING", "【${RuleEngine.incidentNames[inc[Incidents.type]]}】进入多部门联合处置", user.id)
+            MessageResp("事件已进入处置流程")
+        } else {
+            if (inc[Incidents.type] in listOf("SMOKE_COVERED", "SPRINKLER_MODIFICATION") && user.role !in listOf("FIRE", "ADMIN"))
+                throw ApiException(403, "涉及消防设施的事件须由消防维保确认整改完成")
+            Incidents.update({ Incidents.id eq id }) { it[status] = "RESOLVED" }
+            event(orderId, "INCIDENT_RESOLVED",
+                "【${RuleEngine.incidentNames[inc[Incidents.type]]}】整改完成并关闭" +
+                    (if (user.role == "FIRE") "（消防维保确认）" else ""), user.id)
+            notify(orderId, listOf("MERCHANT", "PROPERTY"),
+                "事件【${RuleEngine.incidentNames[inc[Incidents.type]]}】已整改关闭")
+            MessageResp("事件已闭环")
+        }
+    }
+
+    // ---------- 完工与逐项验收 ----------
+    fun completeConstruction(orderId: Long, user: AppUser): MessageResp = transaction {
+        val o = orderRow(orderId)
+        if (o[RenovationOrders.status] != "UNDER_CONSTRUCTION")
+            throw ApiException(409, "仅施工中装修单可报验完工")
+        val reasons = mutableListOf<String>()
+        ApprovalTasks.select { (ApprovalTasks.orderId eq orderId) and (ApprovalTasks.status neq "APPROVED") }.count()
+            .let { if (it > 0L) reasons += "存在 $it 项未通过的审批/改图复核任务" }
+        val openIncidents = Incidents.select { (Incidents.orderId eq orderId) and (Incidents.status neq "RESOLVED") }.count()
+        if (openIncidents > 0L) reasons += "存在 $openIncidents 起未闭环的施工事件"
+        val activePermits = SpecialWorkPermits.select {
+            (SpecialWorkPermits.orderId eq orderId) and
+                (SpecialWorkPermits.status inList listOf("APPLIED", "APPROVED", "IN_PROGRESS"))
+        }.count()
+        if (activePermits > 0L) reasons += "存在 $activePermits 张未完工/未撤回的专项作业票"
+        if (reasons.isNotEmpty()) throw ApiException(409, "不具备完工报验条件：${reasons.joinToString("；")}")
+
+        val categories = listOf("FIRE", "STRONG_ELECTRIC", "WEAK_ELECTRIC", "SMOKE_EXHAUST", "DRAINAGE", "STOREFRONT", "PUBLIC_RESTORE")
+        categories.forEach { cat ->
+            AcceptanceItems.insert {
+                it[AcceptanceItems.orderId] = orderId
+                it[category] = cat
+                it[status] = "PENDING"
+            }
+        }
+        RenovationOrders.update({ RenovationOrders.id eq orderId }) { it[status] = "COMPLETED_PENDING_ACCEPTANCE" }
+        event(orderId, "CONSTRUCTION_COMPLETED", "施工完成报验，生成 7 项逐项验收（消防/强电/弱电/排烟/排水/门头/公共区域恢复）", user.id)
+        notify(orderId, listOf("FIRE", "ENGINEERING", "PROPERTY", "MERCHANT"),
+            "装修单 ${o[RenovationOrders.orderNo]} 进入逐项验收")
+        MessageResp("已进入完工逐项验收（7 项）")
+    }
+
+    fun checkItem(orderId: Long, req: CheckItemReq, user: AppUser): MessageResp = transaction {
+        val o = orderRow(orderId)
+        if (o[RenovationOrders.status] !in listOf("COMPLETED_PENDING_ACCEPTANCE", "RECTIFICATION"))
+            throw ApiException(409, "当前状态不可验收")
+        val item = AcceptanceItems.select { (AcceptanceItems.id eq req.itemId) and (AcceptanceItems.orderId eq orderId) }.firstOrNull()
+            ?: throw ApiException(404, "验收项不存在")
+        val requiredRole = RuleEngine.itemInspectorRole[item[AcceptanceItems.category]]
+        if (user.role != requiredRole && user.role != "ADMIN")
+            throw ApiException(403, "该验收项主责部门为 ${RuleEngine.deptNames[requiredRole]}")
+        if (item[AcceptanceItems.status] == "PASSED") throw ApiException(409, "该验收项已通过")
+
+        AcceptanceItems.update({ AcceptanceItems.id eq req.itemId }) {
+            it[status] = if (req.passed) "PASSED" else "FAILED"
+            it[inspectorId] = user.id
+            it[remark] = req.remark
+            it[checkedAt] = Instant.now()
+        }
+        event(orderId, "ITEM_CHECKED",
+            "${RuleEngine.itemNames[item[AcceptanceItems.category]]}验收${if (req.passed) "通过" else "不合格"}" +
+                (if (req.remark.isNotBlank()) "：${req.remark}" else ""), user.id)
+
+        if (!req.passed) {
+            val deadline = Instant.now().plus(3, ChronoUnit.DAYS)
+            val rid = Rectifications.insert {
+                it[Rectifications.orderId] = orderId
+                it[itemId] = req.itemId
+                it[description] = "${RuleEngine.itemNames[item[AcceptanceItems.category]]}整改：${req.remark}"
+                it[Rectifications.deadline] = deadline
+                it[status] = "OPEN"
+                it[createdAt] = Instant.now()
+            } get Rectifications.id
+            RenovationOrders.update({ RenovationOrders.id eq orderId }) { it[status] = "RECTIFICATION" }
+            event(orderId, "RECTIFICATION_ISSUED", "开具整改单 #$rid，期限 $deadline，逾期影响押金退还与开业许可", user.id)
+            notify(orderId, listOf("MERCHANT", "FLOOR_OPS"),
+                "${RuleEngine.itemNames[item[AcceptanceItems.category]]}验收不合格，整改期限 $deadline")
+            return@transaction MessageResp("验收不合格，已开具整改期限至 $deadline")
+        }
+
+        // 通过时关闭对应整改单（复验通过）
+        Rectifications.update({
+            (Rectifications.orderId eq orderId) and (Rectifications.itemId eq req.itemId) and
+                (Rectifications.status inList listOf("OPEN", "RESUBMITTED"))
+        }) {
+            it[status] = "PASSED"
+            it[resolvedAt] = Instant.now()
+        }
+
+        finalizeAcceptanceIfDone(orderId, user.id)
+        MessageResp("验收通过")
+    }
+
+    private fun finalizeAcceptanceIfDone(orderId: Long, actorId: Long?) {
+        val total = AcceptanceItems.select { AcceptanceItems.orderId eq orderId }.count()
+        val passed = AcceptanceItems.select { (AcceptanceItems.orderId eq orderId) and (AcceptanceItems.status eq "PASSED") }.count()
+        val openRects = Rectifications.select {
+            (Rectifications.orderId eq orderId) and (Rectifications.status inList listOf("OPEN", "RESUBMITTED", "OVERDUE"))
+        }.count()
+        if (total == 7L && passed == 7L && openRects == 0L) {
+            val fireIncidentsOpen = Incidents.select {
+                (Incidents.orderId eq orderId) and
+                    (Incidents.type inList listOf("SMOKE_COVERED", "SPRINKLER_MODIFICATION")) and
+                    (Incidents.status neq "RESOLVED")
+            }.count()
+            val fireOk = fireIncidentsOpen == 0L
+            RenovationOrders.update({ RenovationOrders.id eq orderId }) {
+                it[status] = "ACCEPTED"
+                it[fireReinspectionPassed] = true
+                it[firePermitPassed] = fireOk
+            }
+            event(orderId, "ALL_ITEMS_ACCEPTED",
+                "七项逐项验收全部通过，消防复验${if (fireOk) "通过" else "未通过（消防设施事件未闭环）"}，进入开业许可环节", actorId)
+            notify(orderId, listOf("MERCHANT", "PROPERTY", "FINANCE", "FLOOR_OPS"),
+                "装修单完工验收全部通过；物业凭消防复验结论与押金/扣罚结清情况核发开业许可")
+        }
+    }
+
+    fun submitRectification(req: RectifySubmitReq, user: AppUser): MessageResp = transaction {
+        if (user.role !in listOf("MERCHANT", "ADMIN")) throw ApiException(403, "仅商户可提交整改复验")
+        val r = Rectifications.select { Rectifications.id eq req.rectificationId }.firstOrNull()
+            ?: throw ApiException(404, "整改单不存在")
+        if (r[Rectifications.status] !in listOf("OPEN", "OVERDUE")) throw ApiException(409, "该整改单当前状态不可提交")
+        val orderId = r[Rectifications.orderId]
+        Rectifications.update({ Rectifications.id eq req.rectificationId }) {
+            it[status] = "RESUBMITTED"
+            it[submittedNote] = req.note
+        }
+        r[Rectifications.itemId]?.let { itemId ->
+            AcceptanceItems.update({ AcceptanceItems.id eq itemId }) { it[status] = "PENDING" }
+        }
+        event(orderId, "RECTIFICATION_RESUBMITTED", "商户提交整改复验：${req.note}", user.id)
+        val cat = r[Rectifications.itemId]?.let { itemId ->
+            AcceptanceItems.select { AcceptanceItems.id eq itemId }.firstOrNull()?.get(AcceptanceItems.category)
+        }
+        val role = cat?.let { RuleEngine.itemInspectorRole[it] } ?: "PROPERTY"
+        notify(orderId, listOf(role), "整改单 #${req.rectificationId} 已提交，请安排复验")
+        MessageResp("整改已提交，等待复验")
+    }
+
+    // ---------- 押金扣罚 / 开业许可联动 ----------
+    fun deductPenalty(penaltyId: Long, user: AppUser): MessageResp = transaction {
+        if (user.role !in listOf("FINANCE", "ADMIN")) throw ApiException(403, "仅财务可执行押金扣罚")
+        val p = Penalties.select { Penalties.id eq penaltyId }.firstOrNull() ?: throw ApiException(404, "扣罚记录不存在")
+        if (p[Penalties.deducted]) throw ApiException(409, "该扣罚已执行")
+        val orderId = p[Penalties.orderId]
+        val o = orderRow(orderId)
+        if (!o[RenovationOrders.depositPaid]) throw ApiException(409, "押金尚未缴纳，无法扣罚")
+        if (p[Penalties.amount] > o[RenovationOrders.depositAmount])
+            throw ApiException(409, "扣罚金额超过押金余额，需补缴后处理")
+        Penalties.update({ Penalties.id eq penaltyId }) { it[deducted] = true }
+        val newTotal = o[RenovationOrders.totalPenalty] + p[Penalties.amount]
+        RenovationOrders.update({ RenovationOrders.id eq orderId }) {
+            it[totalPenalty] = newTotal
+        }
+        event(orderId, "PENALTY_DEDUCTED", "财务自押金扣罚 ¥${p[Penalties.amount]}：${p[Penalties.reason]}", user.id)
+        notify(orderId, listOf("MERCHANT", "PROPERTY"), "押金扣罚 ¥${p[Penalties.amount]} 已执行")
+        MessageResp("扣罚 ¥${p[Penalties.amount]} 已从押金中执行")
+    }
+
+    private fun openingBlockers(o: ResultRow, orderId: Long): List<String> {
+        val reasons = mutableListOf<String>()
+        if (o[RenovationOrders.status] != "ACCEPTED") reasons += "完工七项验收未全部通过（当前 ${o[RenovationOrders.status]}）"
+        if (!o[RenovationOrders.fireReinspectionPassed]) reasons += "消防复验未通过"
+        if (!o[RenovationOrders.firePermitPassed]) reasons += "消防开业许可未放行（烟感遮挡/喷淋改动等事件须先整改复验）"
+        if (!o[RenovationOrders.depositPaid]) reasons += "装修押金未缴纳"
+        val unpaid = Penalties.select { (Penalties.orderId eq orderId) and (Penalties.deducted eq false) }.count()
+        if (unpaid > 0L) reasons += "存在 $unpaid 笔押金扣罚未经财务执行"
+        val openRects = Rectifications.select {
+            (Rectifications.orderId eq orderId) and (Rectifications.status inList listOf("OPEN", "RESUBMITTED", "OVERDUE"))
+        }.count()
+        if (openRects > 0L) reasons += "存在 $openRects 项未闭环整改"
+        return reasons
+    }
+
+    fun grantOpening(orderId: Long, user: AppUser): MessageResp = transaction {
+        if (user.role !in listOf("PROPERTY", "ADMIN")) throw ApiException(403, "开业许可由物业核发")
+        val o = orderRow(orderId)
+        val blockers = openingBlockers(o, orderId)
+        if (blockers.isNotEmpty()) throw ApiException(409, "不能核发开业许可：${blockers.joinToString("；")}")
+        RenovationOrders.update({ RenovationOrders.id eq orderId }) { it[openingAllowed] = true }
+        event(orderId, "OPENING_GRANTED", "物业核发开业许可（消防复验通过、验收合格、押金扣罚已结清）", user.id)
+        notify(orderId, listOf("MERCHANT", "FLOOR_OPS", "FINANCE"), "装修单 ${o[RenovationOrders.orderNo]} 开业许可已核发，可以开业")
+        MessageResp("开业许可已核发")
+    }
+
+    fun open(orderId: Long, user: AppUser): MessageResp {
+        // 先在事务中完成校验与拦截审计写入并提交，再抛出 409，避免审计事件随异常回滚
+        val outcome: Pair<List<String>, Boolean> = transaction {
+            val o = orderRow(orderId)
+            if (o[RenovationOrders.merchantUserId] != user.id)
+                throw ApiException(403, "仅本单商户可确认开业")
+            val blockers = openingBlockers(o, orderId).toMutableList()
+            if (!o[RenovationOrders.openingAllowed]) blockers += "物业尚未核发开业许可，商户不得绕过物业直接开业"
+            if (blockers.isNotEmpty()) {
+                event(orderId, "OPENING_BLOCKED", "商户尝试开业被系统拦截：${blockers.joinToString("；")}", user.id)
+                blockers to false
+            } else {
+                RenovationOrders.update({ RenovationOrders.id eq orderId }) { it[status] = "OPENED" }
+                event(orderId, "OPENED", "店铺正式开业，档案归档（验收记录/扣罚/整改/许可齐全）", user.id)
+                notify(orderId, listOf("PROPERTY", "FLOOR_OPS", "FINANCE", "FIRE"), "店铺已开业，装修单归档")
+                emptyList<String>() to true
+            }
+        }
+        if (!outcome.second) throw ApiException(409, "开业被拦截：${outcome.first.joinToString("；")}")
+        return MessageResp("开业成功，装修档案已归档")
+    }
+
+    // ---------- 通知 / 看板 ----------
+    fun notifications(user: AppUser): List<NotificationView> = transaction {
+        val q = Notifications.selectAll().orderBy(Notifications.id, SortOrder.DESC).limit(200)
+        q.filter { n ->
+            val roleOk = n[Notifications.targetRole] == user.role || user.role == "ADMIN"
+            if (!roleOk) return@filter false
+            if (user.role != "MERCHANT") return@filter true
+            val oid = n[Notifications.orderId] ?: return@filter false
+            RenovationOrders.select { (RenovationOrders.id eq oid) and (RenovationOrders.merchantUserId eq user.id) }.count() > 0
+        }.map {
+            NotificationView(it[Notifications.id], it[Notifications.orderId], it[Notifications.targetRole],
+                it[Notifications.message], it[Notifications.readFlag], it[Notifications.createdAt].toString())
+        }
+    }
+
+    fun dashboard(user: AppUser): DashboardResp = transaction {
+        val orders = listOrders(user)
+        val myTasks = if (user.role in RuleEngine.deptNames.keys)
+            ApprovalTasks.select { (ApprovalTasks.dept eq user.role) and (ApprovalTasks.status eq "PENDING") }
+                .orderBy(ApprovalTasks.seq).map {
+                    TaskView(it[ApprovalTasks.id], it[ApprovalTasks.dept], it[ApprovalTasks.title],
+                        it[ApprovalTasks.status], null, null, it[ApprovalTasks.seq])
+                }
+        else emptyList()
+        DashboardResp(user.role, myTasks, orders.take(50), notifications(user))
+    }
+}
