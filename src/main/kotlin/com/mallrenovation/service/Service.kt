@@ -14,6 +14,8 @@ class ApiException(val code: Int, message: String) : RuntimeException(message)
 
 data class AppUser(val id: Long, val username: String, val displayName: String, val role: String) : io.ktor.server.auth.Principal
 
+private val MANAGEMENT_ROLES = listOf("PROPERTY", "ENGINEERING", "SECURITY", "FIRE", "FINANCE", "FLOOR_OPS")
+
 object Service {
 
     private val cnZone = ZoneId.of("Asia/Shanghai")
@@ -317,21 +319,33 @@ object Service {
         MessageResp("押金缴纳凭证已提交，等待财务确认")
     }
 
-    fun startConstruction(orderId: Long, user: AppUser): MessageResp = transaction {
-        val o = orderRow(orderId)
-        if (o[RenovationOrders.status] != "PENDING_REVIEW")
-            throw ApiException(409, "当前状态 ${o[RenovationOrders.status]} 不可开工")
-        val pending = ApprovalTasks.select { (ApprovalTasks.orderId eq orderId) and (ApprovalTasks.status neq "APPROVED") }.count()
-        val reasons = mutableListOf<String>()
-        if (pending > 0L) reasons += "尚有 $pending 项审批任务未通过（六方会签未完成）"
-        if (!o[RenovationOrders.depositPaid]) reasons += "装修押金未缴纳"
-        if (reasons.isNotEmpty()) throw ApiException(409, "不满足开工条件：${reasons.joinToString("；")}")
+    fun startConstruction(orderId: Long, user: AppUser): MessageResp {
+        // 归属/角色校验先在独立事务中提交审计，再拒绝；保证越权不改状态且可追溯
+        val denial = transaction {
+            val o = orderRow(orderId)
+            if (user.role != "ADMIN" && !(user.role == "MERCHANT" && o[RenovationOrders.merchantUserId] == user.id)) {
+                event(orderId, "ACCESS_DENIED",
+                    "用户 ${user.displayName}(${user.role}) 越权请求开工/施工证生效，已拒绝（仅本单授权商户可操作）", user.id)
+                "无权开工：仅本装修单的授权商户可申请施工证生效"
+            } else null
+        }
+        if (denial != null) throw ApiException(403, denial)
+        return transaction {
+            val o = orderRow(orderId)
+            if (o[RenovationOrders.status] != "PENDING_REVIEW")
+                throw ApiException(409, "当前状态 ${o[RenovationOrders.status]} 不可开工")
+            val pending = ApprovalTasks.select { (ApprovalTasks.orderId eq orderId) and (ApprovalTasks.status neq "APPROVED") }.count()
+            val reasons = mutableListOf<String>()
+            if (pending > 0L) reasons += "尚有 $pending 项审批任务未通过（六方会签未完成）"
+            if (!o[RenovationOrders.depositPaid]) reasons += "装修押金未缴纳"
+            if (reasons.isNotEmpty()) throw ApiException(409, "不满足开工条件：${reasons.joinToString("；")}")
 
-        RenovationOrders.update({ RenovationOrders.id eq orderId }) { it[status] = "UNDER_CONSTRUCTION" }
-        event(orderId, "CONSTRUCTION_STARTED", "施工证生效，施工单位 ${o[RenovationOrders.constructionCompany]} 凭证进场", user.id)
-        notify(orderId, listOf("MERCHANT", "SECURITY", "FLOOR_OPS"),
-            "装修单 ${o[RenovationOrders.orderNo]} 施工证已生效，安保门岗启动人员/材料核验")
-        MessageResp("施工证已生效，可进场施工")
+            RenovationOrders.update({ RenovationOrders.id eq orderId }) { it[status] = "UNDER_CONSTRUCTION" }
+            event(orderId, "CONSTRUCTION_STARTED", "施工证生效，施工单位 ${o[RenovationOrders.constructionCompany]} 凭证进场", user.id)
+            notify(orderId, listOf("MERCHANT", "SECURITY", "FLOOR_OPS"),
+                "装修单 ${o[RenovationOrders.orderNo]} 施工证已生效，安保门岗启动人员/材料核验")
+            MessageResp("施工证已生效，可进场施工")
+        }
     }
 
     // ---------- 人员进场核验 ----------
@@ -545,32 +559,71 @@ object Service {
             parties.map { RuleEngine.deptNames[it] ?: it }, Instant.now().toString())
     }
 
-    fun incidentStatus(id: Long, resolve: Boolean, user: AppUser): MessageResp = transaction {
-        val inc = Incidents.select { Incidents.id eq id }.firstOrNull() ?: throw ApiException(404, "事件不存在")
-        val orderId = inc[Incidents.orderId]
-        if (!resolve) {
-            if (inc[Incidents.status] != "OPEN") throw ApiException(409, "事件已在处置中")
-            Incidents.update({ Incidents.id eq id }) { it[status] = "HANDLING" }
-            event(orderId, "INCIDENT_HANDLING", "【${RuleEngine.incidentNames[inc[Incidents.type]]}】进入多部门联合处置", user.id)
-            MessageResp("事件已进入处置流程")
-        } else {
-            if (inc[Incidents.type] in listOf("SMOKE_COVERED", "SPRINKLER_MODIFICATION") && user.role !in listOf("FIRE", "ADMIN"))
-                throw ApiException(403, "涉及消防设施的事件须由消防维保确认整改完成")
-            Incidents.update({ Incidents.id eq id }) { it[status] = "RESOLVED" }
-            event(orderId, "INCIDENT_RESOLVED",
-                "【${RuleEngine.incidentNames[inc[Incidents.type]]}】整改完成并关闭" +
-                    (if (user.role == "FIRE") "（消防维保确认）" else ""), user.id)
-            notify(orderId, listOf("MERCHANT", "PROPERTY"),
-                "事件【${RuleEngine.incidentNames[inc[Incidents.type]]}】已整改关闭")
-            MessageResp("事件已闭环")
+    fun incidentStatus(id: Long, resolve: Boolean, user: AppUser): MessageResp {
+        // 归属/角色校验：事件只能由责任部门（或管理员）推进与闭环；独立事务先落审计再拒绝
+        val denial = transaction {
+            val inc = Incidents.select { Incidents.id eq id }.firstOrNull() ?: throw ApiException(404, "事件不存在")
+            val orderId = inc[Incidents.orderId]
+            if (user.role == "ADMIN") {
+                null
+            } else if (user.role !in MANAGEMENT_ROLES) {
+                event(orderId, "ACCESS_DENIED",
+                    "用户 ${user.displayName}(${user.role}) 非管理角色，请求事件【${RuleEngine.incidentNames[inc[Incidents.type]]}】${if (resolve) "闭环" else "处置"}被拒绝", user.id)
+                "事件仅可由其责任部门处置/闭环，商户等非管理角色无权操作"
+            } else if (resolve) {
+                val owners = RuleEngine.incidentParties[inc[Incidents.type]] ?: emptyList()
+                // 消防设施事件必须由消防维保闭环；其他事件由其涉及的责任部门闭环
+                val strictFire = inc[Incidents.type] in listOf("SMOKE_COVERED", "SPRINKLER_MODIFICATION")
+                val allowed = if (strictFire) user.role == "FIRE" else user.role in owners
+                if (allowed) null else {
+                    val reason = if (strictFire)
+                        "涉及消防设施（烟感/喷淋）的事件必须由消防维保闭环"
+                    else "非该事件责任部门（${owners.joinToString("、") { RuleEngine.deptNames[it] ?: it }}）"
+                    event(orderId, "ACCESS_DENIED",
+                        "用户 ${user.displayName}(${user.role}) 请求闭环事件【${RuleEngine.incidentNames[inc[Incidents.type]]}】被拒绝：$reason", user.id)
+                    "该事件只能由其责任部门${if (strictFire) "（涉及消防设施须消防维保）" else ""}闭环"
+                }
+            } else null
+        }
+        if (denial != null) throw ApiException(403, denial)
+
+        return transaction {
+            val inc = Incidents.select { Incidents.id eq id }.first()
+            val orderId = inc[Incidents.orderId]
+            if (!resolve) {
+                if (inc[Incidents.status] != "OPEN") throw ApiException(409, "事件已在处置中")
+                Incidents.update({ Incidents.id eq id }) { it[status] = "HANDLING" }
+                event(orderId, "INCIDENT_HANDLING", "【${RuleEngine.incidentNames[inc[Incidents.type]]}】进入多部门联合处置", user.id)
+                MessageResp("事件已进入处置流程")
+            } else {
+                Incidents.update({ Incidents.id eq id }) { it[status] = "RESOLVED" }
+                event(orderId, "INCIDENT_RESOLVED",
+                    "【${RuleEngine.incidentNames[inc[Incidents.type]]}】整改完成并关闭" +
+                        (if (user.role == "FIRE") "（消防维保确认）" else "（${RuleEngine.deptNames[user.role] ?: user.role}确认）"), user.id)
+                notify(orderId, listOf("MERCHANT", "PROPERTY"),
+                    "事件【${RuleEngine.incidentNames[inc[Incidents.type]]}】已整改关闭")
+                MessageResp("事件已闭环")
+            }
         }
     }
 
     // ---------- 完工与逐项验收 ----------
-    fun completeConstruction(orderId: Long, user: AppUser): MessageResp = transaction {
-        val o = orderRow(orderId)
-        if (o[RenovationOrders.status] != "UNDER_CONSTRUCTION")
-            throw ApiException(409, "仅施工中装修单可报验完工")
+    fun completeConstruction(orderId: Long, user: AppUser): MessageResp {
+        // 归属校验：仅本单授权商户（或管理员）可报验完工；独立事务先落审计再拒绝
+        val denial = transaction {
+            val o = orderRow(orderId)
+            if (user.role != "ADMIN" && !(user.role == "MERCHANT" && o[RenovationOrders.merchantUserId] == user.id)) {
+                event(orderId, "ACCESS_DENIED",
+                    "用户 ${user.displayName}(${user.role}) 越权请求完工报验，已拒绝（仅本单授权商户可操作）", user.id)
+                "无权报验完工：仅本装修单的授权商户可提交完工报验"
+            } else null
+        }
+        if (denial != null) throw ApiException(403, denial)
+
+        return transaction {
+            val o = orderRow(orderId)
+            if (o[RenovationOrders.status] != "UNDER_CONSTRUCTION")
+                throw ApiException(409, "仅施工中装修单可报验完工")
         val reasons = mutableListOf<String>()
         ApprovalTasks.select { (ApprovalTasks.orderId eq orderId) and (ApprovalTasks.status neq "APPROVED") }.count()
             .let { if (it > 0L) reasons += "存在 $it 项未通过的审批/改图复核任务" }
@@ -596,6 +649,7 @@ object Service {
         notify(orderId, listOf("FIRE", "ENGINEERING", "PROPERTY", "MERCHANT"),
             "装修单 ${o[RenovationOrders.orderNo]} 进入逐项验收")
         MessageResp("已进入完工逐项验收（7 项）")
+        }
     }
 
     fun checkItem(orderId: Long, req: CheckItemReq, user: AppUser): MessageResp = transaction {

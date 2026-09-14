@@ -175,8 +175,15 @@ curl -s -XPOST $BASE/api/orders/$OID/open -H "$auth"   # → 开业成功，装�
 
 `e2e/e2e_check.py` 覆盖：错误密码拒绝、申报规则引擎（六方任务/押金/噪声材料消防规则/邻里通知）、越权拦截、六方会签、押金→施工证、五项核验放行、阻燃材料抽检拦截、动火票（看火人/灭火器强制、审批权限）、两类事件多方协同与扣罚、临时改图复核、完工七项验收+整改复验、扣罚累计、**无开业许可直接开业 409 拦截并写审计**、许可后开业归档、局部维修场景差异化规则。
 
+`e2e/e2e_authz.py` 覆盖关键状态变更的角色/归属校验（越权均 **403**，装修单、验收项、事件状态保持不变，并写 `ACCESS_DENIED` 审计）：
+
+- 开工/施工证生效、完工报验：**仅本装修单授权商户或 ADMIN**；楼层运营、财务、非本单商户请求一律 403；
+- 事件处置（handling）：仅管理角色（物业/工程/安保/消防/财务/楼层运营）；
+- 事件闭环（resolve）：仅该事件的责任部门（如噪声→楼层运营/物业/安保，临时改图→物业/工程/消防/楼层运营）；**烟感遮挡/喷淋改动必须消防维保 FIRE 闭环**；商户（含本单与非本单）一律 403。
+
 ```bash
 BASE=http://host.docker.internal:$(docker compose port app 8080 | cut -d: -f2) python3 e2e/e2e_check.py
+BASE=http://host.docker.internal:$(docker compose port app 8080 | cut -d: -f2) python3 e2e/e2e_authz.py
 ```
 
 ## 主要接口一览
@@ -190,12 +197,12 @@ BASE=http://host.docker.internal:$(docker compose port app 8080 | cut -d: -f2) p
 | POST | `/api/orders` | 商户 | 提交装修申请（触发规则引擎） |
 | POST | `/api/tasks/{id}/review` | 对应部门 | 审批（任一驳回整单退回） |
 | POST | `/api/orders/{id}/deposit/pay` | 商户 | 缴押金 |
-| POST | `/api/orders/{id}/construction/start` | 商户 | 六方通过+押金后开工 |
+| POST | `/api/orders/{id}/construction/start` | **仅本单商户** | 六方通过+押金后开工（楼层运营/财务/非本单商户 403） |
 | POST | `/api/workers/verify` `/api/workers/{id}/admit` | 安保 | 五项核验、放行 |
 | POST | `/api/materials/gate` | 安保/消防 | 材料放行/拦截（阻燃抽检） |
 | POST | `/api/orders/{id}/permits` `/api/permits/{id}/decision|start|finish` | 商户/消防安保 | 专项作业票全生命周期 |
-| POST | `/api/orders/{id}/incidents` `/api/incidents/{id}/handling|resolve` | 各管理部门 | 事件登记与多方闭环 |
-| POST | `/api/orders/{id}/complete` `/api/orders/{id}/checks` | 商户/主责部门 | 完工报验、7 项验收 |
+| POST | `/api/orders/{id}/incidents` `/api/incidents/{id}/handling|resolve` | 各管理部门 | 事件登记与多方闭环；闭环限事件责任部门（消防事件须 FIRE），商户 403 |
+| POST | `/api/orders/{id}/complete` `/api/orders/{id}/checks` | **仅本单商户**报验/主责部门验收 | 完工报验（非本单商户/管理角色 403）、7 项验收 |
 | POST | `/api/rectifications/submit` | 商户 | 整改提交复验 |
 | POST | `/api/penalties/{id}/deduct` | 财务 | 押金扣罚 |
 | POST | `/api/orders/{id}/opening/grant` | 物业 | 核发开业许可（联动校验） |
