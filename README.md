@@ -105,6 +105,17 @@ docker compose down -v       # 同时删除数据库卷
 ### 5. 逐项验收 + 整改复验
 完工报验生成 7 项：消防 FIRE（消防）、强电、弱电、排烟、排水（工程）、门头、公共区域恢复（物业）。任一不合格自动开具整改单与期限，商户提交复验、主责部门复验通过闭环。
 
+#### 消防验收不通过专项整改（喷淋遮挡 / 疏散指示错误）
+消防验收发现 `SPRINKLER_OCCLUDED`（喷淋遮挡）或 `EXIT_SIGN_ERROR`（疏散指示错误，另支持 `OTHER`）时，系统生成带**违规类型、责任施工方（默认取装修单施工单位）、关联问题图纸、复验时间**的消防整改清单：
+
+1. **冻结**：清单开具即冻结开业许可（`firePermitPassed/openingAllowed` 复位），且财务无法退还押金。
+2. **更新图纸**：商户提交整改后更新图纸（`/api/rectifications/drawing`）；每次更新都会重置两方确认。
+3. **双部门分别确认**：消防维保（`/confirm`，FIRE）与工程部（ENGINEERING）必须分别确认，缺一不可，仅一方确认不能复验。
+4. **消防复验**：两方确认后由消防维保复验（`/api/rectifications/reinspect`）；
+   - **复验不通过**：轮次 +1，关联更新图纸与责任施工队生成带明确依据的**押金扣罚记录**（`penalties.rectification_id`），双确认重置，须重新更新图纸确认，押金与开业继续冻结，复验结论推送给商户负责人；
+   - **复验通过**：消防验收项置为通过，随其他验收项一起解冻；复验结论通知商户。
+5. **押金退还**（`POST /api/orders/{id}/deposit/refund`，财务）：所有整改复验通过、消防复验通过、扣罚全部执行后方可退还，退还额 = 押金 − 已执行扣罚；未满足条件明确返回冻结原因。
+
 ### 6. 押金扣罚 → 开业许可 → 开业（防绕过）
 `/opening/grant`（物业核发许可）与 `/open`（商户开业）均执行同一组硬性拦截：
 
@@ -207,6 +218,7 @@ BASE=http://host.docker.internal:$(docker compose port app 8080 | cut -d: -f2) p
 BASE=http://host.docker.internal:$(docker compose port app 8080 | cut -d: -f2) python3 e2e/e2e_authz.py
 BASE=http://host.docker.internal:$(docker compose port app 8080 | cut -d: -f2) python3 e2e/e2e_hotwork.py
 BASE=http://host.docker.internal:$(docker compose port app 8080 | cut -d: -f2) python3 e2e/e2e_multi_permit.py
+BASE=http://host.docker.internal:$(docker compose port app 8080 | cut -d: -f2) python3 e2e/e2e_fire_rectify.py
 ```
 
 ## 主要接口一览
@@ -229,8 +241,12 @@ BASE=http://host.docker.internal:$(docker compose port app 8080 | cut -d: -f2) p
 | POST | `/api/permits/{id}/cancel` | 本单商户/物业 | 取消未开工票，取消后不参与动火风险评估 |
 | POST | `/api/orders/{id}/incidents` `/api/incidents/{id}/handling|resolve` | 各管理部门 | 事件登记与多方闭环；闭环限事件责任部门（消防事件须 FIRE），商户 403 |
 | POST | `/api/orders/{id}/complete` `/api/orders/{id}/checks` | **仅本单商户**报验/主责部门验收 | 完工报验（非本单商户/管理角色 403）、7 项验收 |
-| POST | `/api/rectifications/submit` | 商户 | 整改提交复验 |
+| POST | `/api/rectifications/submit` | 商户 | 普通整改提交复验 |
+| POST | `/api/rectifications/drawing` | 商户 | 消防整改更新图纸（重置双确认） |
+| POST | `/api/rectifications/{id}/confirm` | 消防维保/工程部 | 分别确认更新图纸，两方齐备才可复验 |
+| POST | `/api/rectifications/reinspect` | 消防维保 | 消防复验；不通过生成带图纸/施工队依据的扣罚 |
 | POST | `/api/penalties/{id}/deduct` | 财务 | 押金扣罚 |
+| POST | `/api/orders/{id}/deposit/refund` | 财务 | 押金退还（复验通过前冻结，退还额=押金-扣罚） |
 | POST | `/api/orders/{id}/opening/grant` | 物业 | 核发开业许可（联动校验） |
 | POST | `/api/orders/{id}/open` | 商户 | 确认开业（防绕过拦截） |
 

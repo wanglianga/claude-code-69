@@ -157,9 +157,23 @@ fun Application.configureRouting() {
                 call.respond(Service.submitRectification(req, me))
             }
 
-            // 财务：押金扣罚
+            // 消防专项整改：图纸更新 → 消防/工程双确认 → 消防复验
+            post("/api/rectifications/drawing") {
+                call.respond(Service.updateRectifyDrawing(call.receive(), me))
+            }
+            post("/api/rectifications/{id}/confirm") {
+                call.respond(Service.confirmRectifyDrawing(call.parameters["id"]!!.toLong(), me))
+            }
+            post("/api/rectifications/reinspect") {
+                call.respond(Service.reinspectFire(call.receive(), me))
+            }
+
+            // 财务：押金扣罚与退还（复验通过前退还冻结）
             post("/api/penalties/{id}/deduct") {
                 call.respond(Service.deductPenalty(call.parameters["id"]!!.toLong(), me))
+            }
+            post("/api/orders/{id}/deposit/refund") {
+                call.respond(Service.refundDeposit(call.parameters["id"]!!.toLong(), me))
             }
 
             // 物业：开业许可；商户：确认开业

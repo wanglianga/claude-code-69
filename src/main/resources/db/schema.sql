@@ -45,6 +45,9 @@ CREATE TABLE IF NOT EXISTS renovation_orders (
     total_penalty         NUMERIC(12,2) NOT NULL DEFAULT 0,
     night_work_blocked    BOOLEAN NOT NULL DEFAULT FALSE,   -- 动火复核/异常联动：当晚施工许可是否被暂停
     night_block_reason    VARCHAR(256) NOT NULL DEFAULT '',
+    deposit_refunded      BOOLEAN NOT NULL DEFAULT FALSE,   -- 押金是否已退还（复验通过前冻结）
+    deposit_refund_amount NUMERIC(12,2) NOT NULL DEFAULT 0,
+    deposit_refunded_at   TIMESTAMP,
     created_at            TIMESTAMP NOT NULL DEFAULT now(),
     updated_at            TIMESTAMP NOT NULL DEFAULT now()
 );
@@ -148,6 +151,7 @@ CREATE TABLE IF NOT EXISTS penalties (
     amount      NUMERIC(12,2) NOT NULL,
     reason      VARCHAR(256) NOT NULL,
     deducted    BOOLEAN NOT NULL DEFAULT FALSE,
+    rectification_id BIGINT, -- 扣罚依据：复验不通过的整改项（应用层关联，避免与整改表循环外键）
     created_by  BIGINT REFERENCES users(id),
     created_at  TIMESTAMP NOT NULL DEFAULT now()
 );
@@ -169,10 +173,25 @@ CREATE TABLE IF NOT EXISTS rectifications (
     item_id        BIGINT REFERENCES acceptance_check_items(id),
     description    VARCHAR(512) NOT NULL,
     deadline       TIMESTAMP NOT NULL,
-    status         VARCHAR(16) NOT NULL DEFAULT 'OPEN', -- OPEN/RESUBMITTED/PASSED/OVERDUE
+    status         VARCHAR(20) NOT NULL DEFAULT 'OPEN', -- OPEN/RESUBMITTED/REINSPECT_READY/PASSED/OVERDUE
     submitted_note VARCHAR(512),
     created_at     TIMESTAMP NOT NULL DEFAULT now(),
-    resolved_at    TIMESTAMP
+    resolved_at    TIMESTAMP,
+    -- 消防验收不通过专项整改
+    violation_type       VARCHAR(32) NOT NULL DEFAULT '',  -- SPRINKLER_OCCLUDED 喷淋遮挡 / EXIT_SIGN_ERROR 疏散指示错误 / OTHER
+    responsible_company  VARCHAR(128) NOT NULL DEFAULT '', -- 责任施工方/施工队
+    drawing_ref          VARCHAR(256) NOT NULL DEFAULT '', -- 关联的具体图纸（问题图纸）
+    reinspect_at         TIMESTAMP,                        -- 计划/安排的复验时间
+    updated_drawing      VARCHAR(256) NOT NULL DEFAULT '', -- 整改后更新的图纸
+    fire_confirmed       BOOLEAN NOT NULL DEFAULT FALSE,   -- 消防维保确认更新图纸
+    fire_confirmed_by    BIGINT REFERENCES users(id),
+    fire_confirmed_at    TIMESTAMP,
+    eng_confirmed        BOOLEAN NOT NULL DEFAULT FALSE,   -- 工程部确认更新图纸
+    eng_confirmed_by     BIGINT REFERENCES users(id),
+    eng_confirmed_at     TIMESTAMP,
+    reinspect_round      INT NOT NULL DEFAULT 0,           -- 复验次数（每轮失败 +1）
+    reinspect_result     VARCHAR(16) NOT NULL DEFAULT 'NONE', -- NONE/PASSED/FAILED
+    penalty_id           BIGINT                              -- 复验不通过生成的扣罚依据（应用层关联）
 );
 
 CREATE TABLE IF NOT EXISTS order_events (
@@ -212,3 +231,23 @@ ALTER TABLE special_work_permits ADD COLUMN IF NOT EXISTS site_review_round INT 
 ALTER TABLE special_work_permits ADD COLUMN IF NOT EXISTS site_reviewer_id BIGINT REFERENCES users(id);
 ALTER TABLE special_work_permits ADD COLUMN IF NOT EXISTS site_reviewed_at TIMESTAMP;
 ALTER TABLE special_work_permits ADD COLUMN IF NOT EXISTS paused_reason VARCHAR(48);
+
+-- 消防验收不通过专项整改
+ALTER TABLE rectifications ADD COLUMN IF NOT EXISTS violation_type VARCHAR(32) NOT NULL DEFAULT '';
+ALTER TABLE rectifications ADD COLUMN IF NOT EXISTS responsible_company VARCHAR(128) NOT NULL DEFAULT '';
+ALTER TABLE rectifications ADD COLUMN IF NOT EXISTS drawing_ref VARCHAR(256) NOT NULL DEFAULT '';
+ALTER TABLE rectifications ADD COLUMN IF NOT EXISTS reinspect_at TIMESTAMP;
+ALTER TABLE rectifications ADD COLUMN IF NOT EXISTS updated_drawing VARCHAR(256) NOT NULL DEFAULT '';
+ALTER TABLE rectifications ADD COLUMN IF NOT EXISTS fire_confirmed BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE rectifications ADD COLUMN IF NOT EXISTS fire_confirmed_by BIGINT;
+ALTER TABLE rectifications ADD COLUMN IF NOT EXISTS fire_confirmed_at TIMESTAMP;
+ALTER TABLE rectifications ADD COLUMN IF NOT EXISTS eng_confirmed BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE rectifications ADD COLUMN IF NOT EXISTS eng_confirmed_by BIGINT;
+ALTER TABLE rectifications ADD COLUMN IF NOT EXISTS eng_confirmed_at TIMESTAMP;
+ALTER TABLE rectifications ADD COLUMN IF NOT EXISTS reinspect_round INT NOT NULL DEFAULT 0;
+ALTER TABLE rectifications ADD COLUMN IF NOT EXISTS reinspect_result VARCHAR(16) NOT NULL DEFAULT 'NONE';
+ALTER TABLE rectifications ADD COLUMN IF NOT EXISTS penalty_id BIGINT;
+ALTER TABLE penalties ADD COLUMN IF NOT EXISTS rectification_id BIGINT;
+ALTER TABLE renovation_orders ADD COLUMN IF NOT EXISTS deposit_refunded BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE renovation_orders ADD COLUMN IF NOT EXISTS deposit_refund_amount NUMERIC(12,2) NOT NULL DEFAULT 0;
+ALTER TABLE renovation_orders ADD COLUMN IF NOT EXISTS deposit_refunded_at TIMESTAMP;

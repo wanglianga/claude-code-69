@@ -93,10 +93,32 @@ data class IncidentReq(
 )
 
 @Serializable
-data class CheckItemReq(val itemId: Long, val passed: Boolean, val remark: String = "")
+data class CheckItemReq(
+    val itemId: Long,
+    val passed: Boolean,
+    val remark: String = "",
+    // 消防验收不通过时登记整改清单要素
+    val violationType: String? = null,       // SPRINKLER_OCCLUDED 喷淋遮挡 / EXIT_SIGN_ERROR 疏散指示错误 / OTHER
+    val responsibleCompany: String? = null, // 责任施工方（缺省取装修单施工单位）
+    val drawingRef: String? = null,         // 关联图纸（缺省取申报图纸）
+    val reinspectAt: String? = null         // 计划复验时间（缺省 +3 天）
+)
 
 @Serializable
 data class RectifySubmitReq(val rectificationId: Long, val note: String)
+
+// 商户更新整改图纸
+@Serializable
+data class RectifyDrawingUpdateReq(val rectificationId: Long, val updatedDrawing: String, val note: String = "")
+
+// 消防维保复验结论
+@Serializable
+data class ReinspectReq(
+    val rectificationId: Long,
+    val passed: Boolean,
+    val remark: String = "",
+    val penaltyAmount: Double = 0.0         // 复验不通过时开具扣罚（依据：图纸+施工队）
+)
 
 @Serializable
 data class PayDepositReq(val amount: Double? = null)
@@ -120,6 +142,8 @@ data class OrderSummary(
     val openingAllowed: Boolean,
     val nightWorkBlocked: Boolean = false,
     val nightBlockReason: String = "",
+    val depositRefunded: Boolean = false,
+    val depositRefundAmount: Double = 0.0,
     val createdAt: String
 )
 
@@ -169,7 +193,10 @@ data class IncidentView(
 @Serializable
 data class PenaltyView(
     val id: Long, val incidentId: Long? = null, val amount: Double,
-    val reason: String, val deducted: Boolean
+    val reason: String, val deducted: Boolean,
+    val rectificationId: Long? = null,
+    val drawingRef: String? = null,
+    val responsibleCompany: String? = null
 )
 
 @Serializable
@@ -182,7 +209,21 @@ data class CheckItemView(
 data class RectificationView(
     val id: Long, val itemId: Long? = null, val description: String,
     val deadline: String, val status: String, val submittedNote: String? = null,
-    val createdAt: String, val resolvedAt: String? = null
+    val createdAt: String, val resolvedAt: String? = null,
+    val fireRectification: Boolean = false,
+    val violationType: String = "",
+    val violationName: String = "",
+    val responsibleCompany: String = "",
+    val drawingRef: String = "",
+    val reinspectAt: String? = null,
+    val updatedDrawing: String = "",
+    val fireConfirmed: Boolean = false,
+    val engConfirmed: Boolean = false,
+    val fireConfirmedBy: String? = null,
+    val engConfirmedBy: String? = null,
+    val reinspectRound: Int = 0,
+    val reinspectResult: String = "NONE",
+    val penaltyId: Long? = null
 )
 
 @Serializable

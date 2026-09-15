@@ -213,6 +213,8 @@ object Service {
             openingAllowed = o[RenovationOrders.openingAllowed],
             nightWorkBlocked = o[RenovationOrders.nightWorkBlocked],
             nightBlockReason = o[RenovationOrders.nightBlockReason],
+            depositRefunded = o[RenovationOrders.depositRefunded],
+            depositRefundAmount = o[RenovationOrders.depositRefundAmount].toDouble(),
             createdAt = o[RenovationOrders.createdAt].toString()
         )
     }
@@ -263,18 +265,48 @@ object Service {
                 it[Incidents.rectifyDeadline]?.toString(), it[Incidents.status],
                 parties.map { p -> RuleEngine.deptNames[p] ?: p }, it[Incidents.createdAt].toString())
         }
-        val penalties = Penalties.select { Penalties.orderId eq id }.orderBy(Penalties.id).map {
-            PenaltyView(it[Penalties.id], it[Penalties.incidentId], it[Penalties.amount].toDouble(),
-                it[Penalties.reason], it[Penalties.deducted])
+        val violationNames = mapOf(
+            "SPRINKLER_OCCLUDED" to "喷淋遮挡",
+            "EXIT_SIGN_ERROR" to "疏散指示错误",
+            "OTHER" to "其他消防问题"
+        )
+        val penalties = Penalties.select { Penalties.orderId eq id }.orderBy(Penalties.id).map { row ->
+            val rid = row[Penalties.rectificationId]
+            val rect = rid?.let { Rectifications.select { Rectifications.id eq it }.firstOrNull() }
+            PenaltyView(row[Penalties.id], row[Penalties.incidentId], row[Penalties.amount].toDouble(),
+                row[Penalties.reason], row[Penalties.deducted],
+                rectificationId = rid,
+                drawingRef = rect?.get(Rectifications.updatedDrawing)?.ifBlank { rect[Rectifications.drawingRef] },
+                responsibleCompany = rect?.get(Rectifications.responsibleCompany))
         }
         val items = AcceptanceItems.select { AcceptanceItems.orderId eq id }.orderBy(AcceptanceItems.id).map {
             CheckItemView(it[AcceptanceItems.id], it[AcceptanceItems.category], it[AcceptanceItems.status],
                 userName(it[AcceptanceItems.inspectorId]), it[AcceptanceItems.remark], it[AcceptanceItems.checkedAt]?.toString())
         }
-        val rects = Rectifications.select { Rectifications.orderId eq id }.orderBy(Rectifications.id).map {
-            RectificationView(it[Rectifications.id], it[Rectifications.itemId], it[Rectifications.description],
-                it[Rectifications.deadline].toString(), it[Rectifications.status], it[Rectifications.submittedNote],
-                it[Rectifications.createdAt].toString(), it[Rectifications.resolvedAt]?.toString())
+        val rects = Rectifications.select { Rectifications.orderId eq id }.orderBy(Rectifications.id).map { r ->
+            val isFire = r[Rectifications.violationType].isNotBlank()
+            RectificationView(
+                id = r[Rectifications.id], itemId = r[Rectifications.itemId],
+                description = r[Rectifications.description],
+                deadline = r[Rectifications.deadline].toString(), status = r[Rectifications.status],
+                submittedNote = r[Rectifications.submittedNote],
+                createdAt = r[Rectifications.createdAt].toString(),
+                resolvedAt = r[Rectifications.resolvedAt]?.toString(),
+                fireRectification = isFire,
+                violationType = r[Rectifications.violationType],
+                violationName = violationNames[r[Rectifications.violationType]] ?: "",
+                responsibleCompany = r[Rectifications.responsibleCompany],
+                drawingRef = r[Rectifications.drawingRef],
+                reinspectAt = r[Rectifications.reinspectAt]?.toString(),
+                updatedDrawing = r[Rectifications.updatedDrawing],
+                fireConfirmed = r[Rectifications.fireConfirmed],
+                engConfirmed = r[Rectifications.engConfirmed],
+                fireConfirmedBy = userName(r[Rectifications.fireConfirmedBy]),
+                engConfirmedBy = userName(r[Rectifications.engConfirmedBy]),
+                reinspectRound = r[Rectifications.reinspectRound],
+                reinspectResult = r[Rectifications.reinspectResult],
+                penaltyId = r[Rectifications.penaltyId]
+            )
         }
         val events = OrderEvents.select { OrderEvents.orderId eq id }.orderBy(OrderEvents.id).map {
             EventView(it[OrderEvents.id], it[OrderEvents.eventType], it[OrderEvents.detail],
@@ -979,24 +1011,68 @@ object Service {
 
         if (!req.passed) {
             val deadline = Instant.now().plus(3, ChronoUnit.DAYS)
+            val isFireItem = item[AcceptanceItems.category] == "FIRE"
+            val violation = req.violationType?.takeIf { it.isNotBlank() } ?: ""
+            val reinspectAt = req.reinspectAt?.let { ts(it) } ?: deadline
+            if (violation.isNotBlank()) {
+                if (!isFireItem) throw ApiException(400, "违规类型（喷淋遮挡/疏散指示错误）仅适用于消防验收项")
+                if (violation !in listOf("SPRINKLER_OCCLUDED", "EXIT_SIGN_ERROR", "OTHER"))
+                    throw ApiException(400, "消防违规类型必须为 SPRINKLER_OCCLUDED/EXIT_SIGN_ERROR/OTHER")
+            }
+            val isFireRect = isFireItem && violation.isNotBlank()
+            val responsible = req.responsibleCompany?.takeIf { it.isNotBlank() }
+                ?: o[RenovationOrders.constructionCompany]
+            val drawing = req.drawingRef?.takeIf { it.isNotBlank() } ?: o[RenovationOrders.drawingDoc]
+
             val rid = Rectifications.insert {
                 it[Rectifications.orderId] = orderId
-                it[itemId] = req.itemId
-                it[description] = "${RuleEngine.itemNames[item[AcceptanceItems.category]]}整改：${req.remark}"
+                it[Rectifications.itemId] = req.itemId
+                it[Rectifications.description] = "${RuleEngine.itemNames[item[AcceptanceItems.category]]}整改：${req.remark}"
                 it[Rectifications.deadline] = deadline
-                it[status] = "OPEN"
-                it[createdAt] = Instant.now()
+                it[Rectifications.status] = "OPEN"
+                it[Rectifications.createdAt] = Instant.now()
+                it[Rectifications.violationType] = violation
+                it[Rectifications.responsibleCompany] = if (isFireRect) responsible else ""
+                it[Rectifications.drawingRef] = if (isFireRect) drawing else ""
+                it[Rectifications.reinspectAt] = if (isFireRect) reinspectAt else null
             } get Rectifications.id
-            RenovationOrders.update({ RenovationOrders.id eq orderId }) { it[status] = "RECTIFICATION" }
+            RenovationOrders.update({ RenovationOrders.id eq orderId }) {
+                it[status] = "RECTIFICATION"
+                it[firePermitPassed] = false
+                it[openingAllowed] = false
+                it[fireReinspectionPassed] = false
+            }
+            if (isFireRect) {
+                val vname = when (violation) {
+                    "SPRINKLER_OCCLUDED" -> "喷淋遮挡"
+                    "EXIT_SIGN_ERROR" -> "疏散指示错误"
+                    else -> "消防问题"
+                }
+                event(orderId, "FIRE_RECTIFICATION_ISSUED",
+                    "消防验收不合格（$vname）：${req.remark}；整改清单 #$rid，责任施工方：$responsible，" +
+                        "关联图纸：$drawing，计划复验 $reinspectAt；复验通过前开业许可冻结、押金冻结", user.id)
+                notify(orderId, listOf("MERCHANT", "PROPERTY", "FINANCE", "ENGINEERING"),
+                    "消防整改清单 #$rid（$vname，责任方 $responsible）已开具，复验前开业许可与押金退还冻结")
+                return@transaction MessageResp("消防验收不合格，已生成整改清单（责任方/图纸/复验时间），复验通过前开业许可与押金退还冻结")
+            }
             event(orderId, "RECTIFICATION_ISSUED", "开具整改单 #$rid，期限 $deadline，逾期影响押金退还与开业许可", user.id)
             notify(orderId, listOf("MERCHANT", "FLOOR_OPS"),
                 "${RuleEngine.itemNames[item[AcceptanceItems.category]]}验收不合格，整改期限 $deadline")
             return@transaction MessageResp("验收不合格，已开具整改期限至 $deadline")
         }
 
-        // 通过时关闭对应整改单（复验通过）
+        // 消防专项整改必须走「图纸更新→双确认→消防复验」接口，不允许在此直接关闭
+        val unclosedFireRect = Rectifications.select {
+            (Rectifications.orderId eq orderId) and (Rectifications.itemId eq req.itemId) and
+                (Rectifications.violationType.neq("")) and (Rectifications.status neq "PASSED")
+        }.count()
+        if (item[AcceptanceItems.category] == "FIRE" && unclosedFireRect > 0L)
+            throw ApiException(409, "存在未复验通过的消防专项整改，须更新图纸并经消防维保/工程确认后由消防复验")
+
+        // 通过时关闭对应整改单（复验通过，仅限非消防专项）
         Rectifications.update({
             (Rectifications.orderId eq orderId) and (Rectifications.itemId eq req.itemId) and
+                (Rectifications.violationType eq "") and
                 (Rectifications.status inList listOf("OPEN", "RESUBMITTED"))
         }) {
             it[status] = "PASSED"
@@ -1011,7 +1087,7 @@ object Service {
         val total = AcceptanceItems.select { AcceptanceItems.orderId eq orderId }.count()
         val passed = AcceptanceItems.select { (AcceptanceItems.orderId eq orderId) and (AcceptanceItems.status eq "PASSED") }.count()
         val openRects = Rectifications.select {
-            (Rectifications.orderId eq orderId) and (Rectifications.status inList listOf("OPEN", "RESUBMITTED", "OVERDUE"))
+            (Rectifications.orderId eq orderId) and (Rectifications.status inList listOf("OPEN", "RESUBMITTED", "OVERDUE", "REINSPECT_READY"))
         }.count()
         if (total == 7L && passed == 7L && openRects == 0L) {
             val fireIncidentsOpen = Incidents.select {
@@ -1036,6 +1112,8 @@ object Service {
         if (user.role !in listOf("MERCHANT", "ADMIN")) throw ApiException(403, "仅商户可提交整改复验")
         val r = Rectifications.select { Rectifications.id eq req.rectificationId }.firstOrNull()
             ?: throw ApiException(404, "整改单不存在")
+        if (r[Rectifications.violationType].isNotBlank())
+            throw ApiException(409, "消防专项整改须先更新整改图纸，再经消防维保与工程部分别确认并复验")
         if (r[Rectifications.status] !in listOf("OPEN", "OVERDUE")) throw ApiException(409, "该整改单当前状态不可提交")
         val orderId = r[Rectifications.orderId]
         Rectifications.update({ Rectifications.id eq req.rectificationId }) {
@@ -1052,6 +1130,177 @@ object Service {
         val role = cat?.let { RuleEngine.itemInspectorRole[it] } ?: "PROPERTY"
         notify(orderId, listOf(role), "整改单 #${req.rectificationId} 已提交，请安排复验")
         MessageResp("整改已提交，等待复验")
+    }
+
+    // ---------- 消防专项整改：图纸更新 → 消防/工程双确认 → 复验 ----------
+    private fun fireRectRow(id: Long): ResultRow =
+        Rectifications.select { Rectifications.id eq id }.firstOrNull()
+            ?: throw ApiException(404, "整改清单不存在")
+
+    /** 商户更新整改图纸（关联问题图纸与责任施工方，更新图纸是双确认与复验的前提） */
+    fun updateRectifyDrawing(req: RectifyDrawingUpdateReq, user: AppUser): MessageResp = transaction {
+        if (user.role !in listOf("MERCHANT", "ADMIN")) throw ApiException(403, "仅商户可更新整改图纸")
+        val r = fireRectRow(req.rectificationId)
+        if (r[Rectifications.violationType].isBlank()) throw ApiException(409, "该整改单不是消防专项整改")
+        val orderId = r[Rectifications.orderId]
+        if (orderRow(orderId)[RenovationOrders.merchantUserId] != user.id)
+            throw ApiException(403, "仅本装修单商户可更新整改图纸")
+        if (r[Rectifications.status] == "PASSED") throw ApiException(409, "整改已复验通过")
+        if (req.updatedDrawing.isBlank()) throw ApiException(400, "必须提供更新后的整改图纸")
+        // 每次重新提交都重置双确认，必须重新分别确认
+        Rectifications.update({ Rectifications.id eq req.rectificationId }) {
+            it[updatedDrawing] = req.updatedDrawing
+            it[submittedNote] = req.note
+            it[status] = "RESUBMITTED"
+            it[fireConfirmed] = false
+            it[engConfirmed] = false
+            it[fireConfirmedBy] = null
+            it[engConfirmedBy] = null
+            it[fireConfirmedAt] = null
+            it[engConfirmedAt] = null
+        }
+        event(orderId, "FIRE_RECTIFY_DRAWING_UPDATED",
+            "消防整改 #${req.rectificationId} 更新图纸：${req.updatedDrawing}（问题图纸 ${r[Rectifications.drawingRef]}，" +
+                "责任施工方 ${r[Rectifications.responsibleCompany]}），待消防维保与工程部分别确认", user.id)
+        notify(orderId, listOf("FIRE", "ENGINEERING"),
+            "消防整改 #${req.rectificationId} 已更新图纸（责任方 ${r[Rectifications.responsibleCompany]}），请分别确认")
+        MessageResp("整改图纸已更新，等待消防维保与工程部分别确认")
+    }
+
+    /** 消防维保 / 工程部分别确认更新图纸，两方都确认后进入消防复验 */
+    fun confirmRectifyDrawing(rectificationId: Long, user: AppUser): MessageResp = transaction {
+        val r = fireRectRow(rectificationId)
+        if (r[Rectifications.violationType].isBlank()) throw ApiException(409, "该整改单不是消防专项整改")
+        val orderId = r[Rectifications.orderId]
+        if (r[Rectifications.status] == "PASSED") throw ApiException(409, "整改已复验通过")
+        if (r[Rectifications.updatedDrawing].isBlank())
+            throw ApiException(409, "商户尚未更新整改图纸，无可确认内容")
+        val isFire = user.role == "FIRE" || user.role == "ADMIN"
+        val isEng = user.role == "ENGINEERING" || user.role == "ADMIN"
+        if (!isFire && !isEng) throw ApiException(403, "仅消防维保或工程部可确认整改图纸")
+        val current = fireRectRow(rectificationId)
+        if (isFire && !current[Rectifications.fireConfirmed]) {
+            Rectifications.update({ Rectifications.id eq rectificationId }) {
+                it[fireConfirmed] = true; it[fireConfirmedBy] = user.id; it[fireConfirmedAt] = Instant.now()
+            }
+            event(orderId, "FIRE_RECTIFY_CONFIRMED", "消防维保确认整改 #$rectificationId 更新图纸", user.id)
+        }
+        if (isEng && !current[Rectifications.engConfirmed]) {
+            Rectifications.update({ Rectifications.id eq rectificationId }) {
+                it[engConfirmed] = true; it[engConfirmedBy] = user.id; it[engConfirmedAt] = Instant.now()
+            }
+            event(orderId, "ENG_RECTIFY_CONFIRMED", "工程部确认整改 #$rectificationId 更新图纸", user.id)
+        }
+        val fresh = fireRectRow(rectificationId)
+        if (fresh[Rectifications.fireConfirmed] && fresh[Rectifications.engConfirmed] &&
+            fresh[Rectifications.status] != "REINSPECT_READY") {
+            Rectifications.update({ Rectifications.id eq rectificationId }) { it[status] = "REINSPECT_READY" }
+            event(orderId, "FIRE_RECTIFY_READY",
+                "消防整改 #$rectificationId 经消防维保与工程部分别确认，安排消防复验", user.id)
+            notify(orderId, listOf("FIRE"), "消防整改 #$rectificationId 双部门确认完成，请安排消防复验")
+            return@transaction MessageResp("两方确认完成，可安排消防复验")
+        }
+        MessageResp(if (isFire && user.role != "ADMIN") "消防维保已确认" else "工程部已确认")
+    }
+
+    /** 消防维保复验：通过则解冻；不通过则依据问题图纸与责任施工方生成押金扣罚，须重新更新图纸确认 */
+    fun reinspectFire(req: ReinspectReq, user: AppUser): MessageResp = transaction {
+        if (user.role !in listOf("FIRE", "ADMIN")) throw ApiException(403, "消防复验由消防维保执行")
+        val r = fireRectRow(req.rectificationId)
+        if (r[Rectifications.violationType].isBlank()) throw ApiException(409, "该整改单不是消防专项整改")
+        val orderId = r[Rectifications.orderId]
+        if (r[Rectifications.status] == "PASSED") throw ApiException(409, "整改已复验通过")
+        if (!r[Rectifications.fireConfirmed] || !r[Rectifications.engConfirmed])
+            throw ApiException(409, "整改图纸须经消防维保与工程部分别确认后方可复验")
+        val round = r[Rectifications.reinspectRound] + 1
+        val vname = when (r[Rectifications.violationType]) {
+            "SPRINKLER_OCCLUDED" -> "喷淋遮挡"
+            "EXIT_SIGN_ERROR" -> "疏散指示错误"
+            else -> "消防问题"
+        }
+
+        if (!req.passed) {
+            // 复验不通过 → 明确扣罚依据（关联更新图纸 + 责任施工方）
+            var penaltyId = r[Rectifications.penaltyId]
+            if (req.penaltyAmount > 0) {
+                penaltyId = Penalties.insert {
+                    it[Penalties.orderId] = orderId
+                    it[amount] = money(req.penaltyAmount)
+                    it[reason] = "消防复验第 $round 轮不通过（$vname，责任方 ${r[Rectifications.responsibleCompany]}，" +
+                        "依据图纸 ${r[Rectifications.updatedDrawing].ifBlank { r[Rectifications.drawingRef] }}）：${req.remark}"
+                    it[deducted] = false
+                    it[rectificationId] = req.rectificationId
+                    it[createdBy] = user.id
+                    it[createdAt] = Instant.now()
+                } get Penalties.id
+            }
+            Rectifications.update({ Rectifications.id eq req.rectificationId }) {
+                it[reinspectRound] = round
+                it[reinspectResult] = "FAILED"
+                it[status] = "OPEN"
+                it[fireConfirmed] = false
+                it[engConfirmed] = false
+                if (penaltyId != null) it[Rectifications.penaltyId] = penaltyId
+            }
+            event(orderId, "FIRE_REINSPECT_FAILED",
+                "消防整改 #${req.rectificationId} 第 $round 轮复验不通过（$vname），责任施工方 ${r[Rectifications.responsibleCompany]}，" +
+                    "关联图纸 ${r[Rectifications.updatedDrawing].ifBlank { r[Rectifications.drawingRef] }}" +
+                        (if (penaltyId != null) "，已生成扣罚依据 #$penaltyId" else ""), user.id)
+            notify(orderId, listOf("MERCHANT", "FINANCE", "PROPERTY"),
+                "【复验不通过】消防整改 #${req.rectificationId}（$vname）第 $round 轮复验仍不合格，须更新图纸并重新经两方确认；开业许可与押金退还继续冻结" +
+                    (if (penaltyId != null) "；扣罚依据 #$penaltyId 待财务执行" else ""))
+            return@transaction MessageResp("复验不通过，已关联图纸/施工队${if (penaltyId != null) "并生成扣罚依据" else ""}，开业与押金继续冻结")
+        }
+
+        // 复验通过
+        Rectifications.update({ Rectifications.id eq req.rectificationId }) {
+            it[reinspectRound] = round
+            it[reinspectResult] = "PASSED"
+            it[status] = "PASSED"
+            it[resolvedAt] = Instant.now()
+        }
+        r[Rectifications.itemId]?.let { itemId ->
+            AcceptanceItems.update({ AcceptanceItems.id eq itemId }) {
+                it[status] = "PASSED"; it[inspectorId] = user.id
+                it[remark] = "第 $round 轮消防复验通过" + if (req.remark.isNotBlank()) "：${req.remark}" else ""
+                it[checkedAt] = Instant.now()
+            }
+        }
+        event(orderId, "FIRE_REINSPECT_PASSED",
+            "消防整改 #${req.rectificationId} 第 $round 轮复验通过（$vname，责任方 ${r[Rectifications.responsibleCompany]}）", user.id)
+        notify(orderId, listOf("MERCHANT"),
+            "【复验通过】消防整改 #${req.rectificationId}（$vname）第 $round 轮复验合格，相关开业限制按整改进度解除")
+        finalizeAcceptanceIfDone(orderId, user.id)
+        MessageResp("消防复验通过")
+    }
+
+    /** 财务退还押金（扣除已执行扣罚后的余额）；复验/整改未完成时冻结 */
+    fun refundDeposit(orderId: Long, user: AppUser): MessageResp = transaction {
+        if (user.role !in listOf("FINANCE", "ADMIN")) throw ApiException(403, "仅财务可退还押金")
+        val o = orderRow(orderId)
+        if (!o[RenovationOrders.depositPaid]) throw ApiException(409, "押金未缴纳")
+        if (o[RenovationOrders.depositRefunded]) throw ApiException(409, "押金已退还")
+        val unresolved = Rectifications.select {
+            (Rectifications.orderId eq orderId) and
+                (Rectifications.status neq "PASSED")
+        }.count()
+        val reasons = mutableListOf<String>()
+        if (unresolved > 0L) reasons += "存在 $unresolved 项未通过复验的整改（含消防整改）"
+        if (!o[RenovationOrders.fireReinspectionPassed]) reasons += "消防复验尚未全部通过"
+        val unpaid = Penalties.select { (Penalties.orderId eq orderId) and (Penalties.deducted eq false) }.count()
+        if (unpaid > 0L) reasons += "存在 $unpaid 笔扣罚未执行（复验不通过的扣罚依据须先处理）"
+        if (reasons.isNotEmpty()) throw ApiException(409, "押金退还冻结：${reasons.joinToString("；")}")
+
+        val refundable = (o[RenovationOrders.depositAmount] - o[RenovationOrders.totalPenalty]).coerceAtLeast(BigDecimal.ZERO)
+        RenovationOrders.update({ RenovationOrders.id eq orderId }) {
+            it[depositRefunded] = true
+            it[depositRefundAmount] = refundable
+            it[depositRefundedAt] = Instant.now()
+        }
+        event(orderId, "DEPOSIT_REFUNDED",
+            "财务退还押金 ¥$refundable（押金 ¥${o[RenovationOrders.depositAmount]} - 已扣罚 ¥${o[RenovationOrders.totalPenalty]}）", user.id)
+        notify(orderId, listOf("MERCHANT", "PROPERTY"), "押金余额 ¥$refundable 已退还")
+        MessageResp("押金 ¥$refundable 已退还（扣罚 ¥${o[RenovationOrders.totalPenalty]}）")
     }
 
     // ---------- 押金扣罚 / 开业许可联动 ----------
@@ -1083,7 +1332,7 @@ object Service {
         val unpaid = Penalties.select { (Penalties.orderId eq orderId) and (Penalties.deducted eq false) }.count()
         if (unpaid > 0L) reasons += "存在 $unpaid 笔押金扣罚未经财务执行"
         val openRects = Rectifications.select {
-            (Rectifications.orderId eq orderId) and (Rectifications.status inList listOf("OPEN", "RESUBMITTED", "OVERDUE"))
+            (Rectifications.orderId eq orderId) and (Rectifications.status inList listOf("OPEN", "RESUBMITTED", "OVERDUE", "REINSPECT_READY"))
         }.count()
         if (openRects > 0L) reasons += "存在 $openRects 项未闭环整改"
         return reasons
